@@ -3,10 +3,14 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{AppResult, config::SEGMENT_SECONDS, ffmpeg};
+
+const STABLE_COPY_ATTEMPTS: usize = 3;
+const STABLE_COPY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub(crate) struct ReplayBuffer {
     segment_dir: PathBuf,
@@ -44,14 +48,15 @@ impl ReplayBuffer {
         let export_dir = self.clip_dir.join(format!("clip-work-{export_id}"));
         fs::create_dir_all(&export_dir)?;
 
-        let copied_segments = copy_segments(&segments, &export_dir)?;
+        let copied_segments = copy_stable_segments(&segments, &export_dir)?;
         if copied_segments.is_empty() {
             return Err("No replay segments could be copied for export".into());
         }
 
         let concat_list = write_concat_list(&copied_segments, &export_dir)?;
         let clip_path = self.clip_dir.join(format!("clip-{export_id}.mp4"));
-        save_clip(&concat_list, &clip_path)?;
+        let temp_clip_path = self.clip_dir.join(format!("clip-{export_id}.tmp.mp4"));
+        save_validated_clip(&concat_list, &temp_clip_path, &clip_path)?;
 
         if let Err(error) = fs::remove_dir_all(&export_dir) {
             eprintln!(
@@ -79,18 +84,19 @@ impl ReplayBuffer {
             .collect::<Vec<_>>();
 
         segments.sort_by_key(|(modified, _)| *modified);
+        segments.pop();
         Ok(segments.into_iter().map(|(_, path)| path).collect())
     }
 }
 
-fn copy_segments(segments: &[PathBuf], export_dir: &Path) -> AppResult<Vec<PathBuf>> {
+fn copy_stable_segments(segments: &[PathBuf], export_dir: &Path) -> AppResult<Vec<PathBuf>> {
     let mut copied_segments = Vec::new();
     for (index, source) in segments.iter().enumerate() {
         let destination = export_dir.join(format!("segment-{index:03}.ts"));
-        match fs::copy(source, &destination) {
-            Ok(_) => copied_segments.push(destination),
+        match copy_stable_segment(source, &destination) {
+            Ok(()) => copied_segments.push(destination),
             Err(error) => eprintln!(
-                "Skipping replay segment {} because it could not be copied: {error}",
+                "Skipping replay segment {} because it was not stable during export: {error}",
                 source.display()
             ),
         }
@@ -99,13 +105,66 @@ fn copy_segments(segments: &[PathBuf], export_dir: &Path) -> AppResult<Vec<PathB
     Ok(copied_segments)
 }
 
+fn copy_stable_segment(source: &Path, destination: &Path) -> AppResult<()> {
+    for attempt in 1..=STABLE_COPY_ATTEMPTS {
+        let before = fs::metadata(source)?;
+        let copied_bytes = fs::copy(source, destination)?;
+        let after = fs::metadata(source)?;
+
+        if before.len() == after.len()
+            && before.modified().ok() == after.modified().ok()
+            && copied_bytes == after.len()
+        {
+            return Ok(());
+        }
+
+        if let Err(error) = fs::remove_file(destination) {
+            eprintln!(
+                "Could not remove unstable copied segment {}: {error}",
+                destination.display()
+            );
+        }
+
+        if attempt < STABLE_COPY_ATTEMPTS {
+            thread::sleep(STABLE_COPY_RETRY_DELAY);
+        }
+    }
+
+    Err("segment changed while it was being copied".into())
+}
+
 fn write_concat_list(copied_segments: &[PathBuf], export_dir: &Path) -> AppResult<PathBuf> {
     let concat_list = export_dir.join("segments.txt");
     let mut concat_file = fs::File::create(&concat_list)?;
     for segment in copied_segments {
         writeln!(concat_file, "file '{}'", ffmpeg::concat_path(segment))?;
+        writeln!(concat_file, "duration {SEGMENT_SECONDS}.0")?;
     }
     Ok(concat_list)
+}
+
+fn save_validated_clip(
+    concat_list: &Path,
+    temp_clip_path: &Path,
+    clip_path: &Path,
+) -> AppResult<()> {
+    if let Err(error) = save_clip(concat_list, temp_clip_path)
+        .and_then(|()| validate_clip(temp_clip_path))
+        .and_then(|()| fs::rename(temp_clip_path, clip_path).map_err(Into::into))
+    {
+        if let Err(remove_error) = fs::remove_file(temp_clip_path) {
+            if remove_error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "Could not remove failed temporary clip {}: {remove_error}",
+                    temp_clip_path.display()
+                );
+            }
+        }
+
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn save_clip(concat_list: &Path, clip_path: &Path) -> AppResult<()> {
@@ -131,6 +190,36 @@ fn save_clip(concat_list: &Path, clip_path: &Path) -> AppResult<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg failed to save replay clip: {stderr}").into());
+    }
+
+    Ok(())
+}
+
+fn validate_clip(clip_path: &Path) -> AppResult<()> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(clip_path)
+        .output()
+        .map_err(|error| format!("Could not start ffprobe to validate replay clip: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ffprobe failed to validate replay clip: {stderr}").into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.lines().any(|line| line.trim() == "video") {
+        return Err("ffprobe did not find a video stream in the exported replay clip".into());
     }
 
     Ok(())

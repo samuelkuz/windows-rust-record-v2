@@ -9,16 +9,29 @@ use crate::{
     config::{FRAME_RATE, SEGMENT_BUFFER_SECONDS, SEGMENT_SECONDS},
 };
 
+pub(crate) struct AudioInput {
+    pub(crate) pipe_path: String,
+    pub(crate) sample_format: &'static str,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+}
+
 pub(crate) fn ensure_available() -> AppResult<()> {
-    let status = Command::new("ffmpeg")
+    ensure_tool_available("ffmpeg")?;
+    ensure_tool_available("ffprobe")?;
+    Ok(())
+}
+
+fn ensure_tool_available(tool: &str) -> AppResult<()> {
+    let status = Command::new(tool)
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|error| format!("Could not start ffmpeg. Is it installed and on PATH? {error}"))?;
+        .map_err(|error| format!("Could not start {tool}. Is it installed and on PATH? {error}"))?;
 
     if !status.success() {
-        return Err(format!("ffmpeg -version failed with status {status}").into());
+        return Err(format!("{tool} -version failed with status {status}").into());
     }
 
     Ok(())
@@ -69,6 +82,7 @@ pub(crate) fn write_png(path: &Path, width: i32, height: i32, pixels: &[u8]) -> 
 pub(crate) fn start_gpu_replay_encoder(
     primary_monitor_handle: u64,
     segment_path_pattern: PathBuf,
+    audio_input: Option<AudioInput>,
 ) -> AppResult<Child> {
     if !supports_filter("gfxcapture") {
         return Err("ffmpeg does not list the gfxcapture D3D11 capture source".into());
@@ -87,8 +101,8 @@ pub(crate) fn start_gpu_replay_encoder(
         "lavfi",
         "-i",
         &format!("gfxcapture=hmonitor={primary_monitor_handle}:max_framerate={FRAME_RATE}"),
-        "-an",
     ]);
+    apply_audio_input_options(&mut command, audio_input);
     apply_nvenc_options(&mut command);
     apply_segment_options(&mut command, segment_path_pattern)
 }
@@ -97,6 +111,7 @@ pub(crate) fn start_cpu_replay_encoder(
     width: i32,
     height: i32,
     segment_path_pattern: PathBuf,
+    audio_input: Option<AudioInput>,
 ) -> AppResult<Child> {
     let mut command = Command::new("ffmpeg");
     command.args([
@@ -113,18 +128,57 @@ pub(crate) fn start_cpu_replay_encoder(
         &FRAME_RATE.to_string(),
         "-i",
         "pipe:0",
-        "-an",
     ]);
+    apply_audio_input_options(&mut command, audio_input);
 
     if supports_encoder("h264_nvenc") {
         apply_nvenc_options(&mut command);
     } else {
         eprintln!("ffmpeg does not list h264_nvenc; falling back to libx264.");
-        command.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]);
+        command.args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            "23",
+            "-bf",
+            "0",
+        ]);
     }
 
     command.args(["-pix_fmt", "yuv420p"]);
     apply_segment_options(&mut command, segment_path_pattern)
+}
+
+fn apply_audio_input_options(command: &mut Command, audio_input: Option<AudioInput>) {
+    if let Some(audio_input) = audio_input {
+        command
+            .args(["-thread_queue_size", "1024"])
+            .args(["-f", audio_input.sample_format])
+            .arg("-ar")
+            .arg(audio_input.sample_rate.to_string())
+            .arg("-ac")
+            .arg(audio_input.channels.to_string())
+            .arg("-i")
+            .arg(audio_input.pipe_path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                "-af",
+                "aresample=async=1:first_pts=0",
+            ]);
+    } else {
+        command.arg("-an");
+    }
 }
 
 fn apply_nvenc_options(command: &mut Command) {
@@ -137,6 +191,8 @@ fn apply_nvenc_options(command: &mut Command) {
         "vbr",
         "-cq",
         "23",
+        "-bf",
+        "0",
     ]);
 }
 
@@ -152,6 +208,10 @@ fn apply_segment_options(command: &mut Command, segment_path_pattern: PathBuf) -
             &gop_size,
             "-force_key_frames",
             &force_key_frames,
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
             "-f",
             "segment",
             "-segment_time",
