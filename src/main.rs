@@ -1,5 +1,6 @@
 mod capture;
 mod config;
+mod display;
 mod ffmpeg;
 mod hotkey;
 mod recorder;
@@ -30,9 +31,9 @@ fn main() -> AppResult<()> {
             .get(index + 1)
             .and_then(|seconds| seconds.parse::<u64>().ok())
             .unwrap_or(REPLAY_SECONDS + POST_ROLL_SECONDS);
-        let capturer = PrimaryDisplayCapture::new()?;
         let replay_buffer = Arc::new(ReplayBuffer::new()?);
-        let _capture_thread = recorder::start_capture_thread(capturer, replay_buffer.clone())?;
+        let recorder = recorder::start(replay_buffer.clone())?;
+        println!("Capture backend: {}", recorder.backend().label());
         println!("Recording test replay for {seconds} seconds...");
         thread::sleep(Duration::from_secs(seconds));
         let path = replay_buffer.save_recent_clip(seconds)?;
@@ -45,11 +46,11 @@ fn main() -> AppResult<()> {
 
 fn run_replay_recorder() -> AppResult<()> {
     let registered_hotkey = hotkey::register()?;
-    let capturer = PrimaryDisplayCapture::new()?;
     let replay_buffer = Arc::new(ReplayBuffer::new()?);
-    let _capture_thread = recorder::start_capture_thread(capturer, replay_buffer.clone())?;
+    let recorder = recorder::start(replay_buffer.clone())?;
 
     println!("Replay recorder is running.");
+    println!("Capture backend: {}", recorder.backend().label());
     println!(
         "Press {} to save the last {} seconds plus {} seconds after the hotkey.",
         registered_hotkey.label(),

@@ -66,7 +66,34 @@ pub(crate) fn write_png(path: &Path, width: i32, height: i32, pixels: &[u8]) -> 
     Ok(())
 }
 
-pub(crate) fn start_replay_encoder(
+pub(crate) fn start_gpu_replay_encoder(
+    primary_monitor_handle: u64,
+    segment_path_pattern: PathBuf,
+) -> AppResult<Child> {
+    if !supports_filter("gfxcapture") {
+        return Err("ffmpeg does not list the gfxcapture D3D11 capture source".into());
+    }
+
+    if !supports_encoder("h264_nvenc") {
+        return Err("ffmpeg does not list h264_nvenc for D3D11 hardware-frame encoding".into());
+    }
+
+    let mut command = Command::new("ffmpeg");
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("gfxcapture=hmonitor={primary_monitor_handle}:max_framerate={FRAME_RATE}"),
+        "-an",
+    ]);
+    apply_nvenc_options(&mut command);
+    apply_segment_options(&mut command, segment_path_pattern)
+}
+
+pub(crate) fn start_cpu_replay_encoder(
     width: i32,
     height: i32,
     segment_path_pattern: PathBuf,
@@ -90,21 +117,30 @@ pub(crate) fn start_replay_encoder(
     ]);
 
     if supports_encoder("h264_nvenc") {
-        command.args([
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p5",
-            "-rc",
-            "vbr",
-            "-cq",
-            "23",
-        ]);
+        apply_nvenc_options(&mut command);
     } else {
         eprintln!("ffmpeg does not list h264_nvenc; falling back to libx264.");
         command.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23"]);
     }
 
+    command.args(["-pix_fmt", "yuv420p"]);
+    apply_segment_options(&mut command, segment_path_pattern)
+}
+
+fn apply_nvenc_options(command: &mut Command) {
+    command.args([
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p5",
+        "-rc",
+        "vbr",
+        "-cq",
+        "23",
+    ]);
+}
+
+fn apply_segment_options(command: &mut Command, segment_path_pattern: PathBuf) -> AppResult<Child> {
     let gop_size = FRAME_RATE.to_string();
     let segment_seconds = SEGMENT_SECONDS.to_string();
     let segment_buffer_seconds = SEGMENT_BUFFER_SECONDS.to_string();
@@ -116,8 +152,6 @@ pub(crate) fn start_replay_encoder(
             &gop_size,
             "-force_key_frames",
             &force_key_frames,
-            "-pix_fmt",
-            "yuv420p",
             "-f",
             "segment",
             "-segment_time",
@@ -137,7 +171,7 @@ pub(crate) fn start_replay_encoder(
         .map_err(|error| format!("Could not start replay ffmpeg encoder: {error}").into())
 }
 
-fn supports_encoder(encoder: &str) -> bool {
+pub(crate) fn supports_encoder(encoder: &str) -> bool {
     let output = Command::new("ffmpeg")
         .args(["-hide_banner", "-encoders"])
         .output();
@@ -145,6 +179,19 @@ fn supports_encoder(encoder: &str) -> bool {
     match output {
         Ok(output) if output.status.success() => {
             String::from_utf8_lossy(&output.stdout).contains(encoder)
+        }
+        _ => false,
+    }
+}
+
+fn supports_filter(filter: &str) -> bool {
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-filters"])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).contains(filter)
         }
         _ => false,
     }
