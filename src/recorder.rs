@@ -19,7 +19,7 @@ pub(crate) struct ReplayRecorder {
     stop_requested: Arc<AtomicBool>,
     gpu_encoder: Option<Child>,
     cpu_capture_thread: Option<thread::JoinHandle<()>>,
-    audio_capture_thread: Option<thread::JoinHandle<()>>,
+    audio_capture_threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl ReplayRecorder {
@@ -41,7 +41,7 @@ impl Drop for ReplayRecorder {
             let _ = cpu_capture_thread.join();
         }
 
-        if let Some(audio_capture_thread) = self.audio_capture_thread.take() {
+        for audio_capture_thread in self.audio_capture_threads.drain(..) {
             let _ = audio_capture_thread.join();
         }
     }
@@ -87,17 +87,16 @@ fn start_gpu_gfxcapture(
 ) -> AppResult<ReplayRecorder> {
     let primary_monitor = display::primary_monitor_handle()?;
     let stop_requested = Arc::new(AtomicBool::new(false));
-    let audio_input = prepare_audio_input();
+    let audio = prepare_audio(config);
     let mut gpu_encoder = ffmpeg::start_gpu_replay_encoder(
         primary_monitor.as_u64(),
         replay_buffer.segment_path_pattern(),
         config,
-        audio_input
-            .as_ref()
-            .map(audio::PreparedLoopbackAudio::ffmpeg_input),
+        audio.as_ref().map(audio::PreparedAudio::ffmpeg_plan),
     )?;
-    let audio_capture_thread =
-        audio_input.map(|audio_input| audio_input.start(Arc::clone(&stop_requested)));
+    let audio_capture_threads = audio
+        .map(|audio| audio.start(Arc::clone(&stop_requested)))
+        .unwrap_or_default();
 
     thread::sleep(Duration::from_millis(500));
     if let Some(status) = gpu_encoder.try_wait()? {
@@ -112,7 +111,7 @@ fn start_gpu_gfxcapture(
         stop_requested,
         gpu_encoder: Some(gpu_encoder),
         cpu_capture_thread: None,
-        audio_capture_thread,
+        audio_capture_threads,
     })
 }
 
@@ -122,33 +121,32 @@ fn start_cpu_readback(
 ) -> AppResult<ReplayRecorder> {
     let capturer = PrimaryDisplayCapture::new()?;
     let stop_requested = Arc::new(AtomicBool::new(false));
-    let audio_input = prepare_audio_input();
-    let audio_ffmpeg_input = audio_input
-        .as_ref()
-        .map(audio::PreparedLoopbackAudio::ffmpeg_input);
+    let audio = prepare_audio(&config);
+    let audio_ffmpeg_plan = audio.as_ref().map(audio::PreparedAudio::ffmpeg_plan);
     let cpu_capture_thread = start_cpu_readback_capture_thread(
         capturer,
         replay_buffer,
-        audio_ffmpeg_input,
+        audio_ffmpeg_plan,
         config,
         Arc::clone(&stop_requested),
     )?;
-    let audio_capture_thread =
-        audio_input.map(|audio_input| audio_input.start(Arc::clone(&stop_requested)));
+    let audio_capture_threads = audio
+        .map(|audio| audio.start(Arc::clone(&stop_requested)))
+        .unwrap_or_default();
 
     Ok(ReplayRecorder {
         backend: CaptureBackend::CpuReadback,
         stop_requested,
         gpu_encoder: None,
         cpu_capture_thread: Some(cpu_capture_thread),
-        audio_capture_thread,
+        audio_capture_threads,
     })
 }
 
 fn start_cpu_readback_capture_thread(
     capturer: PrimaryDisplayCapture,
     replay_buffer: Arc<ReplayBuffer>,
-    audio_input: Option<ffmpeg::AudioInput>,
+    audio_input: Option<ffmpeg::AudioPlan>,
     config: RecorderConfig,
     stop_requested: Arc<AtomicBool>,
 ) -> AppResult<thread::JoinHandle<()>> {
@@ -212,15 +210,15 @@ fn start_cpu_readback_capture_thread(
     }))
 }
 
-fn prepare_audio_input() -> Option<audio::PreparedLoopbackAudio> {
-    match audio::prepare_loopback_audio() {
-        Ok(audio_input) => Some(audio_input),
+fn prepare_audio(config: &RecorderConfig) -> Option<audio::PreparedAudio> {
+    match audio::prepare_audio(&config.audio) {
+        Ok(audio) => Some(audio),
         Err(error) => {
             tracing::warn!(
                 error = %error,
-                "could not prepare WASAPI loopback audio; recording video only"
+                "could not prepare WASAPI audio; recording video only"
             );
-            eprintln!("Could not prepare WASAPI loopback audio; recording video only: {error}");
+            eprintln!("Could not prepare WASAPI audio; recording video only: {error}");
             None
         }
     }

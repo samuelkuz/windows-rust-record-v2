@@ -19,10 +19,10 @@ use windows::{
         },
         Media::{
             Audio::{
-                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-                IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-                MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole,
-                eRender,
+                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE, EDataFlow, IAudioCaptureClient,
+                IAudioClient, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, WAVE_FORMAT_PCM,
+                WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eCapture, eConsole, eRender,
             },
             KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE},
             Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
@@ -41,21 +41,47 @@ use windows::{
     core::{HRESULT, IUnknown, PCWSTR},
 };
 
-use crate::{AppResult, ffmpeg};
+use crate::{AppResult, config::AudioConfig, ffmpeg};
 
 const AUDIO_PIPE_BUFFER_BYTES: u32 = 192_000;
 const AUDIO_BUFFER_100NS: i64 = 10_000_000;
 const SILENCE_POLL_MS: u64 = 5;
 const MAX_SILENCE_WRITE_MS: u32 = 100;
 
-pub(crate) struct PreparedLoopbackAudio {
+pub(crate) struct PreparedAudio {
+    captures: Vec<PreparedAudioCapture>,
+    output_policy: ffmpeg::AudioOutputPolicy,
+}
+
+impl PreparedAudio {
+    pub(crate) fn ffmpeg_plan(&self) -> ffmpeg::AudioPlan {
+        ffmpeg::AudioPlan {
+            inputs: self
+                .captures
+                .iter()
+                .map(PreparedAudioCapture::ffmpeg_input)
+                .collect(),
+            output: self.output_policy.clone(),
+        }
+    }
+
+    pub(crate) fn start(self, stop_requested: Arc<AtomicBool>) -> Vec<thread::JoinHandle<()>> {
+        self.captures
+            .into_iter()
+            .map(|capture| capture.start(Arc::clone(&stop_requested)))
+            .collect()
+    }
+}
+
+struct PreparedAudioCapture {
     pipe_server: NamedPipeServer,
     pipe_path: String,
+    source: AudioSource,
     spec: AudioSpec,
 }
 
-impl PreparedLoopbackAudio {
-    pub(crate) fn ffmpeg_input(&self) -> ffmpeg::AudioInput {
+impl PreparedAudioCapture {
+    fn ffmpeg_input(&self) -> ffmpeg::AudioInput {
         ffmpeg::AudioInput {
             pipe_path: self.pipe_path.clone(),
             sample_format: self.spec.ffmpeg_sample_format,
@@ -64,49 +90,124 @@ impl PreparedLoopbackAudio {
         }
     }
 
-    pub(crate) fn start(self, stop_requested: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+    fn start(self, stop_requested: Arc<AtomicBool>) -> thread::JoinHandle<()> {
         thread::spawn(move || {
-            if let Err(error) = run_loopback_capture(self.pipe_server, stop_requested) {
+            if let Err(error) =
+                run_audio_capture(self.pipe_server, self.source, self.spec, stop_requested)
+            {
                 if !is_expected_pipe_close(error.as_ref()) {
-                    tracing::warn!(error = %error, "WASAPI loopback audio capture stopped");
-                    eprintln!("WASAPI loopback audio capture stopped: {error}");
+                    tracing::warn!(error = %error, "WASAPI audio capture stopped");
+                    eprintln!("WASAPI audio capture stopped: {error}");
                 }
             }
         })
     }
 }
 
-pub(crate) fn prepare_loopback_audio() -> AppResult<PreparedLoopbackAudio> {
+pub(crate) fn prepare_audio(config: &AudioConfig) -> AppResult<PreparedAudio> {
+    let mut captures = Vec::new();
+
+    if config.system_audio {
+        captures.push(prepare_audio_capture(AudioSource::SystemLoopback {
+            device_id: config.render_device_id.clone(),
+        })?);
+    }
+
+    if config.microphone {
+        captures.push(prepare_audio_capture(AudioSource::Microphone {
+            device_id: config.capture_device_id.clone(),
+        })?);
+    }
+
+    if captures.is_empty() {
+        return Err("No audio sources are enabled".into());
+    }
+
+    Ok(PreparedAudio {
+        captures,
+        output_policy: ffmpeg::AudioOutputPolicy {
+            sample_rate: config.output_sample_rate,
+            channels: config.output_channels,
+            bitrate: config.bitrate.clone(),
+        },
+    })
+}
+
+fn prepare_audio_capture(source: AudioSource) -> AppResult<PreparedAudioCapture> {
     let pipe_path = unique_pipe_path()?;
     let pipe_server = NamedPipeServer::new(&pipe_path)?;
-    let spec = probe_loopback_audio_spec()?;
+    let spec = probe_audio_spec(&source)?;
 
-    Ok(PreparedLoopbackAudio {
+    Ok(PreparedAudioCapture {
         pipe_server,
         pipe_path,
+        source,
         spec,
     })
 }
 
-fn probe_loopback_audio_spec() -> AppResult<AudioSpec> {
+fn probe_audio_spec(source: &AudioSource) -> AppResult<AudioSpec> {
     let _com = ComApartment::initialize()?;
-    let audio_client = default_render_audio_client()?;
+    let audio_client = audio_client_for_source(source)?;
     let mix_format = MixFormat::get(&audio_client)?;
     unsafe { AudioSpec::from_wave_format(mix_format.as_ptr()) }
 }
 
-fn run_loopback_capture(
+fn run_audio_capture(
     pipe_server: NamedPipeServer,
+    source: AudioSource,
+    expected_spec: AudioSpec,
     stop_requested: Arc<AtomicBool>,
 ) -> AppResult<()> {
     let mut pipe = pipe_server.connect()?;
     let _com = ComApartment::initialize()?;
-    let capture = LoopbackCapture::open()?;
+
+    while !stop_requested.load(Ordering::Relaxed) {
+        match run_audio_capture_session(&mut pipe, &source, expected_spec, &stop_requested) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_device_invalidated(error.as_ref()) => {
+                tracing::warn!(
+                    source = source.label(),
+                    error = %error,
+                    "WASAPI audio device changed; reopening capture"
+                );
+                eprintln!(
+                    "WASAPI {} device changed; reopening audio capture.",
+                    source.label()
+                );
+                thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn run_audio_capture_session(
+    pipe: &mut File,
+    source: &AudioSource,
+    expected_spec: AudioSpec,
+    stop_requested: &AtomicBool,
+) -> AppResult<()> {
+    let capture = WasapiCapture::open(source)?;
+    if capture.spec != expected_spec {
+        return Err(format!(
+            "WASAPI {} device reopened with a different format; restart recording to use sample_rate={} channels={} frame_bytes={}",
+            source.label(),
+            capture.spec.sample_rate,
+            capture.spec.channels,
+            capture.spec.frame_bytes
+        )
+        .into());
+    }
+
     tracing::info!(
+        source = source.label(),
         sample_rate = capture.spec.sample_rate,
         channels = capture.spec.channels,
         frame_bytes = capture.spec.frame_bytes,
-        "WASAPI loopback audio capture started"
+        "WASAPI audio capture started"
     );
     let _running = RunningAudioClient::start(&capture.audio_client)?;
     let mut timeline = AudioTimeline::new(capture.spec, capture.silence_fill_delay_frames);
@@ -114,7 +215,7 @@ fn run_loopback_capture(
     while !stop_requested.load(Ordering::Relaxed) {
         let mut packet_frames = unsafe { capture.capture_client.GetNextPacketSize()? };
         if packet_frames == 0 {
-            timeline.write_due_silence(&mut pipe)?;
+            timeline.write_due_silence(pipe)?;
             thread::sleep(Duration::from_millis(SILENCE_POLL_MS));
             continue;
         }
@@ -138,7 +239,7 @@ fn run_loopback_capture(
                 )?;
             }
 
-            let write_result = timeline.write_packet(&mut pipe, data, frame_count, flags);
+            let write_result = timeline.write_packet(pipe, data, frame_count, flags);
             unsafe {
                 capture.capture_client.ReleaseBuffer(frame_count)?;
             }
@@ -151,16 +252,16 @@ fn run_loopback_capture(
     Ok(())
 }
 
-struct LoopbackCapture {
+struct WasapiCapture {
     audio_client: IAudioClient,
     capture_client: IAudioCaptureClient,
     spec: AudioSpec,
     silence_fill_delay_frames: u64,
 }
 
-impl LoopbackCapture {
-    fn open() -> AppResult<Self> {
-        let audio_client = default_render_audio_client()?;
+impl WasapiCapture {
+    fn open(source: &AudioSource) -> AppResult<Self> {
+        let audio_client = audio_client_for_source(source)?;
         let mix_format = MixFormat::get(&audio_client)?;
         let spec = unsafe { AudioSpec::from_wave_format(mix_format.as_ptr())? };
         let silence_fill_delay_frames = default_silence_fill_delay_frames(&audio_client, spec)?;
@@ -168,7 +269,7 @@ impl LoopbackCapture {
         unsafe {
             audio_client.Initialize(
                 AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
+                source.stream_flags(),
                 AUDIO_BUFFER_100NS,
                 0,
                 mix_format.as_ptr(),
@@ -183,6 +284,43 @@ impl LoopbackCapture {
             spec,
             silence_fill_delay_frames,
         })
+    }
+}
+
+#[derive(Clone)]
+enum AudioSource {
+    SystemLoopback { device_id: Option<String> },
+    Microphone { device_id: Option<String> },
+}
+
+impl AudioSource {
+    fn data_flow(&self) -> EDataFlow {
+        match self {
+            Self::SystemLoopback { .. } => eRender,
+            Self::Microphone { .. } => eCapture,
+        }
+    }
+
+    fn device_id(&self) -> Option<&str> {
+        match self {
+            Self::SystemLoopback { device_id } | Self::Microphone { device_id } => {
+                device_id.as_deref()
+            }
+        }
+    }
+
+    fn stream_flags(&self) -> u32 {
+        match self {
+            Self::SystemLoopback { .. } => AUDCLNT_STREAMFLAGS_LOOPBACK,
+            Self::Microphone { .. } => 0,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::SystemLoopback { .. } => "system",
+            Self::Microphone { .. } => "microphone",
+        }
     }
 }
 
@@ -267,15 +405,35 @@ fn default_silence_fill_delay_frames(
     Ok((device_period_frames * 2).max(spec.sample_rate as u64 / 100))
 }
 
-fn default_render_audio_client() -> AppResult<IAudioClient> {
+fn audio_client_for_source(source: &AudioSource) -> AppResult<IAudioClient> {
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None::<&IUnknown>, CLSCTX_ALL)? };
-    let device: IMMDevice = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole)? };
+
+    let device = if let Some(device_id) = source.device_id() {
+        selected_audio_device(&enumerator, device_id)?
+    } else {
+        unsafe { enumerator.GetDefaultAudioEndpoint(source.data_flow(), eConsole)? }
+    };
+
     let audio_client = unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None)? };
     Ok(audio_client)
 }
 
-#[derive(Clone, Copy)]
+fn selected_audio_device(
+    enumerator: &IMMDeviceEnumerator,
+    device_id: &str,
+) -> AppResult<IMMDevice> {
+    let mut wide_device_id = device_id.encode_utf16().collect::<Vec<_>>();
+    wide_device_id.push(0);
+    let device = unsafe { enumerator.GetDevice(PCWSTR(wide_device_id.as_ptr()))? };
+    let state = unsafe { device.GetState()? };
+    if state != DEVICE_STATE_ACTIVE {
+        return Err(format!("Selected audio device is not active: {device_id}").into());
+    }
+    Ok(device)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct AudioSpec {
     ffmpeg_sample_format: &'static str,
     sample_rate: u32,
@@ -348,6 +506,12 @@ fn is_expected_pipe_close(error: &(dyn Error + 'static)) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::UnexpectedEof
     ) || matches!(io_error.raw_os_error(), Some(109 | 232))
+}
+
+fn is_device_invalidated(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<windows::core::Error>()
+        .is_some_and(|error| error.code() == AUDCLNT_E_DEVICE_INVALIDATED)
 }
 
 struct RunningAudioClient {

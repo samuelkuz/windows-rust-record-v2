@@ -7,6 +7,8 @@ pub(crate) const DEFAULT_REPLAY_SECONDS: u64 = 15;
 pub(crate) const DEFAULT_POST_ROLL_SECONDS: u64 = 5;
 pub(crate) const DEFAULT_SEGMENT_SECONDS: u64 = 1;
 pub(crate) const DEFAULT_SEGMENT_BUFFER_SECONDS: u64 = 90;
+pub(crate) const DEFAULT_AUDIO_SAMPLE_RATE: u32 = 48_000;
+pub(crate) const DEFAULT_AUDIO_CHANNELS: u16 = 2;
 pub(crate) const DXGI_FRAME_TIMEOUT_MS: u32 = 50;
 
 #[derive(Clone, Debug)]
@@ -38,6 +40,18 @@ pub(crate) struct RecorderConfig {
     pub(crate) segment_seconds: u64,
     pub(crate) segment_buffer_seconds: u64,
     pub(crate) output_dir: PathBuf,
+    pub(crate) audio: AudioConfig,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AudioConfig {
+    pub(crate) system_audio: bool,
+    pub(crate) microphone: bool,
+    pub(crate) render_device_id: Option<String>,
+    pub(crate) capture_device_id: Option<String>,
+    pub(crate) output_sample_rate: u32,
+    pub(crate) output_channels: u16,
+    pub(crate) bitrate: String,
 }
 
 impl RecorderConfig {
@@ -50,6 +64,14 @@ impl RecorderConfig {
     }
 
     pub(crate) fn clip_dir(&self) -> PathBuf {
+        if self
+            .output_dir
+            .file_name()
+            .is_some_and(|name| name == "clips")
+        {
+            return self.output_dir.clone();
+        }
+
         self.output_dir.join("clips")
     }
 
@@ -66,7 +88,22 @@ impl Default for RecorderConfig {
             post_roll_seconds: DEFAULT_POST_ROLL_SECONDS,
             segment_seconds: DEFAULT_SEGMENT_SECONDS,
             segment_buffer_seconds: DEFAULT_SEGMENT_BUFFER_SECONDS,
-            output_dir: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            output_dir: default_output_dir(),
+            audio: AudioConfig::default(),
+        }
+    }
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            system_audio: true,
+            microphone: false,
+            render_device_id: None,
+            capture_device_id: None,
+            output_sample_rate: DEFAULT_AUDIO_SAMPLE_RATE,
+            output_channels: DEFAULT_AUDIO_CHANNELS,
+            bitrate: "160k".to_string(),
         }
     }
 }
@@ -124,6 +161,33 @@ pub(crate) fn parse_args() -> AppResult<AppConfig> {
                 let value = next_value(&args, &mut index, "--output-dir")?;
                 recorder.output_dir = absolute_path(PathBuf::from(value))?;
             }
+            "--no-system-audio" => {
+                recorder.audio.system_audio = false;
+                index += 1;
+            }
+            "--microphone" => {
+                recorder.audio.microphone = true;
+                index += 1;
+            }
+            "--audio-output-device-id" => {
+                recorder.audio.render_device_id =
+                    Some(next_value(&args, &mut index, "--audio-output-device-id")?);
+            }
+            "--audio-input-device-id" => {
+                recorder.audio.capture_device_id =
+                    Some(next_value(&args, &mut index, "--audio-input-device-id")?);
+            }
+            "--audio-sample-rate" => {
+                recorder.audio.output_sample_rate =
+                    parse_next_u32(&args, &mut index, "--audio-sample-rate")?;
+            }
+            "--audio-channels" => {
+                recorder.audio.output_channels =
+                    parse_next_u16(&args, &mut index, "--audio-channels")?;
+            }
+            "--audio-bitrate" => {
+                recorder.audio.bitrate = next_value(&args, &mut index, "--audio-bitrate")?;
+            }
             unknown => return Err(format!("Unknown argument: {unknown}\n\n{}", usage()).into()),
         }
     }
@@ -168,6 +232,22 @@ fn validate_recorder_config(config: &RecorderConfig) -> AppResult<()> {
         .into());
     }
 
+    if !config.audio.system_audio && !config.audio.microphone {
+        return Err("At least one audio source must be enabled".into());
+    }
+
+    if config.audio.output_sample_rate == 0 {
+        return Err("--audio-sample-rate must be greater than 0".into());
+    }
+
+    if !matches!(config.audio.output_channels, 1 | 2) {
+        return Err("--audio-channels must be 1 or 2".into());
+    }
+
+    if config.audio.bitrate.trim().is_empty() {
+        return Err("--audio-bitrate must not be empty".into());
+    }
+
     Ok(())
 }
 
@@ -179,6 +259,11 @@ fn parse_next_u32(args: &[String], index: &mut usize, flag: &str) -> AppResult<u
 fn parse_next_u64(args: &[String], index: &mut usize, flag: &str) -> AppResult<u64> {
     let value = next_value(args, index, flag)?;
     parse_u64(&value, flag)
+}
+
+fn parse_next_u16(args: &[String], index: &mut usize, flag: &str) -> AppResult<u16> {
+    let value = next_value(args, index, flag)?;
+    parse_u16(&value, flag)
 }
 
 fn next_value(args: &[String], index: &mut usize, flag: &str) -> AppResult<String> {
@@ -203,12 +288,22 @@ fn parse_u64(value: &str, flag: &str) -> AppResult<u64> {
         .map_err(|error| format!("{flag} must be a positive integer: {error}").into())
 }
 
+fn parse_u16(value: &str, flag: &str) -> AppResult<u16> {
+    value
+        .parse::<u16>()
+        .map_err(|error| format!("{flag} must be a positive integer: {error}").into())
+}
+
 fn absolute_path(path: PathBuf) -> AppResult<PathBuf> {
     if path.is_absolute() {
         Ok(path)
     } else {
         Ok(env::current_dir()?.join(path))
     }
+}
+
+fn default_output_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 pub(crate) fn usage() -> &'static str {
@@ -223,5 +318,12 @@ Options:
   --post-roll-seconds <seconds>
   --segment-seconds <seconds>
   --segment-buffer-seconds <seconds>
-  --output-dir <path>"
+  --output-dir <path>
+  --no-system-audio
+  --microphone
+  --audio-output-device-id <wasapi-device-id>
+  --audio-input-device-id <wasapi-device-id>
+  --audio-sample-rate <hz>     (default: 48000)
+  --audio-channels <channels>  (default: 2)
+  --audio-bitrate <bitrate>    (default: 160k)"
 }

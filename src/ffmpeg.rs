@@ -13,6 +13,18 @@ pub(crate) struct AudioInput {
     pub(crate) channels: u16,
 }
 
+pub(crate) struct AudioPlan {
+    pub(crate) inputs: Vec<AudioInput>,
+    pub(crate) output: AudioOutputPolicy,
+}
+
+#[derive(Clone)]
+pub(crate) struct AudioOutputPolicy {
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+    pub(crate) bitrate: String,
+}
+
 pub(crate) fn ensure_available() -> AppResult<()> {
     ensure_tool_available("ffmpeg")?;
     ensure_tool_available("ffprobe")?;
@@ -80,7 +92,7 @@ pub(crate) fn start_gpu_replay_encoder(
     primary_monitor_handle: u64,
     segment_path_pattern: PathBuf,
     config: &RecorderConfig,
-    audio_input: Option<AudioInput>,
+    audio_plan: Option<AudioPlan>,
 ) -> AppResult<Child> {
     if !supports_filter("gfxcapture") {
         tracing::warn!("ffmpeg does not list the gfxcapture D3D11 capture source");
@@ -96,7 +108,7 @@ pub(crate) fn start_gpu_replay_encoder(
         frame_rate = config.frame_rate,
         primary_monitor_handle,
         segment_path_pattern = %segment_path_pattern.display(),
-        audio = audio_input.is_some(),
+        audio = audio_plan.is_some(),
         "starting ffmpeg GPU replay encoder"
     );
 
@@ -113,7 +125,7 @@ pub(crate) fn start_gpu_replay_encoder(
             config.frame_rate
         ),
     ]);
-    apply_audio_input_options(&mut command, audio_input);
+    apply_audio_input_options(&mut command, audio_plan);
     apply_nvenc_options(&mut command);
     apply_segment_options(&mut command, segment_path_pattern, config)
 }
@@ -123,9 +135,9 @@ pub(crate) fn start_cpu_replay_encoder(
     height: i32,
     segment_path_pattern: PathBuf,
     config: &RecorderConfig,
-    audio_input: Option<AudioInput>,
+    audio_plan: Option<AudioPlan>,
 ) -> AppResult<Child> {
-    let has_audio = audio_input.is_some();
+    let has_audio = audio_plan.is_some();
     let mut command = Command::new("ffmpeg");
     command.args([
         "-hide_banner",
@@ -142,7 +154,7 @@ pub(crate) fn start_cpu_replay_encoder(
         "-i",
         "pipe:0",
     ]);
-    apply_audio_input_options(&mut command, audio_input);
+    apply_audio_input_options(&mut command, audio_plan);
 
     if supports_encoder("h264_nvenc") {
         tracing::info!(
@@ -183,31 +195,65 @@ pub(crate) fn start_cpu_replay_encoder(
     apply_segment_options(&mut command, segment_path_pattern, config)
 }
 
-fn apply_audio_input_options(command: &mut Command, audio_input: Option<AudioInput>) {
-    if let Some(audio_input) = audio_input {
+fn apply_audio_input_options(command: &mut Command, audio_plan: Option<AudioPlan>) {
+    if let Some(audio_plan) = audio_plan {
+        let input_count = audio_plan.inputs.len();
+        for audio_input in audio_plan.inputs {
+            command
+                .args(["-thread_queue_size", "1024"])
+                .args(["-f", audio_input.sample_format])
+                .arg("-ar")
+                .arg(audio_input.sample_rate.to_string())
+                .arg("-ac")
+                .arg(audio_input.channels.to_string())
+                .arg("-i")
+                .arg(audio_input.pipe_path);
+        }
+
+        command.args(["-map", "0:v:0"]);
+        if input_count == 1 {
+            command
+                .args(["-map", "1:a:0"])
+                .args(["-af", &audio_output_filter(&audio_plan.output)]);
+        } else {
+            let filter = audio_mix_filter(input_count, &audio_plan.output);
+            command
+                .args(["-filter_complex", &filter])
+                .args(["-map", "[aout]"]);
+        }
         command
-            .args(["-thread_queue_size", "1024"])
-            .args(["-f", audio_input.sample_format])
-            .arg("-ar")
-            .arg(audio_input.sample_rate.to_string())
-            .arg("-ac")
-            .arg(audio_input.channels.to_string())
-            .arg("-i")
-            .arg(audio_input.pipe_path)
-            .args([
-                "-map",
-                "0:v:0",
-                "-map",
-                "1:a:0",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "160k",
-                "-af",
-                "aresample=async=1:first_pts=0",
-            ]);
+            .args(["-c:a", "aac"])
+            .args(["-b:a", &audio_plan.output.bitrate])
+            .args(["-ar", &audio_plan.output.sample_rate.to_string()])
+            .args(["-ac", &audio_plan.output.channels.to_string()]);
     } else {
         command.arg("-an");
+    }
+}
+
+fn audio_output_filter(output: &AudioOutputPolicy) -> String {
+    format!(
+        "aresample=async=1:first_pts=0,aresample={},aformat=channel_layouts={}",
+        output.sample_rate,
+        channel_layout(output.channels)
+    )
+}
+
+fn audio_mix_filter(input_count: usize, output: &AudioOutputPolicy) -> String {
+    let inputs = (0..input_count)
+        .map(|index| format!("[{}:a:0]", index + 1))
+        .collect::<String>();
+    format!(
+        "{inputs}amix=inputs={input_count}:duration=longest:dropout_transition=0,{}[aout]",
+        audio_output_filter(output)
+    )
+}
+
+fn channel_layout(channels: u16) -> &'static str {
+    match channels {
+        1 => "mono",
+        2 => "stereo",
+        _ => "stereo",
     }
 }
 
