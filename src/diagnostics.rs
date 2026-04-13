@@ -21,7 +21,7 @@ use tracing::{
 use crate::{AppResult, config::RecorderConfig};
 
 pub(crate) fn init(config: &RecorderConfig) -> AppResult<PathBuf> {
-    let log_dir = config.output_dir.join("logs");
+    let log_dir = config.log_dir();
     fs::create_dir_all(&log_dir)?;
     let log_path = log_dir.join("app.log");
     let file = OpenOptions::new()

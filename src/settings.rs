@@ -59,7 +59,7 @@ impl AppSettings {
         fs::write(
             &self.path,
             format!(
-                "# Windows Rust Record settings\n# Edit hotkey, then use Reload settings from the tray menu.\nhotkey = \"{}\"\nstart_with_windows = {}\n",
+                "# Windows Rust Record settings\n# Edit this TOML file, then use Reload settings from the tray menu.\nhotkey = \"{}\"\nstart_with_windows = {}\n",
                 self.hotkey, self.start_with_windows
             ),
         )?;

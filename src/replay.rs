@@ -203,7 +203,8 @@ fn save_validated_clip(
 }
 
 fn save_clip(concat_list: &Path, clip_path: &Path) -> AppResult<()> {
-    let output = Command::new("ffmpeg")
+    let tools = ffmpeg::FfmpegTools::resolve()?;
+    let output = Command::new(tools.ffmpeg())
         .args([
             "-hide_banner",
             "-loglevel",
@@ -220,7 +221,12 @@ fn save_clip(concat_list: &Path, clip_path: &Path) -> AppResult<()> {
         .args(["-c", "copy", "-movflags", "+faststart", "-y"])
         .arg(clip_path)
         .output()
-        .map_err(|error| format!("Could not start ffmpeg to save replay clip: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Could not start ffmpeg at {} to save replay clip: {error}",
+                tools.ffmpeg().display()
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -231,7 +237,8 @@ fn save_clip(concat_list: &Path, clip_path: &Path) -> AppResult<()> {
 }
 
 fn validate_clip(clip_path: &Path) -> AppResult<()> {
-    let output = Command::new("ffprobe")
+    let tools = ffmpeg::FfmpegTools::resolve()?;
+    let output = Command::new(tools.ffprobe())
         .args([
             "-hide_banner",
             "-loglevel",
@@ -245,7 +252,12 @@ fn validate_clip(clip_path: &Path) -> AppResult<()> {
         ])
         .arg(clip_path)
         .output()
-        .map_err(|error| format!("Could not start ffprobe to validate replay clip: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Could not start ffprobe at {} to validate replay clip: {error}",
+                tools.ffprobe().display()
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

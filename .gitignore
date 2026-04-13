@@ -1,6 +1,8 @@
 /target
+/dist
 /clips
 /logs
 /replay-segments
 /screenshots
 /settings.txt
+/settings.toml

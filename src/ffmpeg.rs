@@ -1,4 +1,5 @@
 use std::{
+    env,
     io::Write,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -25,19 +26,70 @@ pub(crate) struct AudioOutputPolicy {
     pub(crate) bitrate: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FfmpegTools {
+    ffmpeg: PathBuf,
+    ffprobe: PathBuf,
+}
+
+impl FfmpegTools {
+    pub(crate) fn resolve() -> AppResult<Self> {
+        let exe_dir = env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let current_dir = env::current_dir().ok();
+
+        let mut candidates = Vec::new();
+        if let Some(exe_dir) = exe_dir {
+            candidates.push(exe_dir.join("ffmpeg").join("bin"));
+        }
+        if let Some(current_dir) = current_dir {
+            candidates.push(current_dir.join("vendor").join("ffmpeg").join("bin"));
+            candidates.push(current_dir.join("ffmpeg").join("bin"));
+        }
+
+        for bin_dir in candidates {
+            let ffmpeg = bin_dir.join("ffmpeg.exe");
+            let ffprobe = bin_dir.join("ffprobe.exe");
+            if ffmpeg.is_file() && ffprobe.is_file() {
+                return Ok(Self { ffmpeg, ffprobe });
+            }
+        }
+
+        Ok(Self {
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+        })
+    }
+
+    pub(crate) fn ffmpeg(&self) -> &Path {
+        &self.ffmpeg
+    }
+
+    pub(crate) fn ffprobe(&self) -> &Path {
+        &self.ffprobe
+    }
+}
+
 pub(crate) fn ensure_available() -> AppResult<()> {
-    ensure_tool_available("ffmpeg")?;
-    ensure_tool_available("ffprobe")?;
+    let tools = FfmpegTools::resolve()?;
+    ensure_tool_available("ffmpeg", tools.ffmpeg())?;
+    ensure_tool_available("ffprobe", tools.ffprobe())?;
     Ok(())
 }
 
-fn ensure_tool_available(tool: &str) -> AppResult<()> {
-    let status = Command::new(tool)
+fn ensure_tool_available(tool: &str, path: &Path) -> AppResult<()> {
+    let status = Command::new(path)
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|error| format!("Could not start {tool}. Is it installed and on PATH? {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Could not start {tool} at {}. Package releases should include ffmpeg\\bin\\{tool}.exe next to the app; development builds may also use tools on PATH. {error}",
+                path.display()
+            )
+        })?;
 
     if !status.success() {
         return Err(format!("{tool} -version failed with status {status}").into());
@@ -47,7 +99,8 @@ fn ensure_tool_available(tool: &str) -> AppResult<()> {
 }
 
 pub(crate) fn write_png(path: &Path, width: i32, height: i32, pixels: &[u8]) -> AppResult<()> {
-    let mut child = Command::new("ffmpeg")
+    let tools = FfmpegTools::resolve()?;
+    let mut child = Command::new(tools.ffmpeg())
         .args([
             "-hide_banner",
             "-loglevel",
@@ -70,7 +123,12 @@ pub(crate) fn write_png(path: &Path, width: i32, height: i32, pixels: &[u8]) -> 
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("Could not start ffmpeg. Is it installed and on PATH? {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Could not start ffmpeg at {}: {error}",
+                tools.ffmpeg().display()
+            )
+        })?;
 
     let mut stdin = child
         .stdin
@@ -94,12 +152,13 @@ pub(crate) fn start_gpu_replay_encoder(
     config: &RecorderConfig,
     audio_plan: Option<AudioPlan>,
 ) -> AppResult<Child> {
-    if !supports_filter("gfxcapture") {
+    let tools = FfmpegTools::resolve()?;
+    if !supports_filter(&tools, "gfxcapture") {
         tracing::warn!("ffmpeg does not list the gfxcapture D3D11 capture source");
         return Err("ffmpeg does not list the gfxcapture D3D11 capture source".into());
     }
 
-    if !supports_encoder("h264_nvenc") {
+    if !supports_encoder(&tools, "h264_nvenc") {
         tracing::warn!("ffmpeg does not list h264_nvenc for D3D11 hardware-frame encoding");
         return Err("ffmpeg does not list h264_nvenc for D3D11 hardware-frame encoding".into());
     }
@@ -112,7 +171,7 @@ pub(crate) fn start_gpu_replay_encoder(
         "starting ffmpeg GPU replay encoder"
     );
 
-    let mut command = Command::new("ffmpeg");
+    let mut command = Command::new(tools.ffmpeg());
     command.args([
         "-hide_banner",
         "-loglevel",
@@ -138,7 +197,8 @@ pub(crate) fn start_cpu_replay_encoder(
     audio_plan: Option<AudioPlan>,
 ) -> AppResult<Child> {
     let has_audio = audio_plan.is_some();
-    let mut command = Command::new("ffmpeg");
+    let tools = FfmpegTools::resolve()?;
+    let mut command = Command::new(tools.ffmpeg());
     command.args([
         "-hide_banner",
         "-loglevel",
@@ -156,7 +216,7 @@ pub(crate) fn start_cpu_replay_encoder(
     ]);
     apply_audio_input_options(&mut command, audio_plan);
 
-    if supports_encoder("h264_nvenc") {
+    if supports_encoder(&tools, "h264_nvenc") {
         tracing::info!(
             width,
             height,
@@ -314,8 +374,8 @@ fn apply_segment_options(
         .map_err(|error| format!("Could not start replay ffmpeg encoder: {error}").into())
 }
 
-pub(crate) fn supports_encoder(encoder: &str) -> bool {
-    let output = Command::new("ffmpeg")
+pub(crate) fn supports_encoder(tools: &FfmpegTools, encoder: &str) -> bool {
+    let output = Command::new(tools.ffmpeg())
         .args(["-hide_banner", "-encoders"])
         .output();
 
@@ -327,8 +387,8 @@ pub(crate) fn supports_encoder(encoder: &str) -> bool {
     }
 }
 
-fn supports_filter(filter: &str) -> bool {
-    let output = Command::new("ffmpeg")
+fn supports_filter(tools: &FfmpegTools, filter: &str) -> bool {
+    let output = Command::new(tools.ffmpeg())
         .args(["-hide_banner", "-filters"])
         .output();
 

@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf};
 
-use crate::AppResult;
+use crate::{AppResult, paths::AppPaths};
 
 pub(crate) const DEFAULT_FRAME_RATE: u32 = 60;
 pub(crate) const DEFAULT_REPLAY_SECONDS: u64 = 15;
@@ -39,7 +39,7 @@ pub(crate) struct RecorderConfig {
     pub(crate) post_roll_seconds: u64,
     pub(crate) segment_seconds: u64,
     pub(crate) segment_buffer_seconds: u64,
-    pub(crate) output_dir: PathBuf,
+    pub(crate) paths: AppPaths,
     pub(crate) audio: AudioConfig,
 }
 
@@ -60,27 +60,23 @@ impl RecorderConfig {
     }
 
     pub(crate) fn segment_dir(&self) -> PathBuf {
-        self.output_dir.join("replay-segments")
+        self.paths.replay_segments_dir.clone()
     }
 
     pub(crate) fn clip_dir(&self) -> PathBuf {
-        if self
-            .output_dir
-            .file_name()
-            .is_some_and(|name| name == "clips")
-        {
-            return self.output_dir.clone();
-        }
-
-        self.output_dir.join("clips")
+        self.paths.clips_dir.clone()
     }
 
     pub(crate) fn screenshot_dir(&self) -> PathBuf {
-        self.output_dir.join("screenshots")
+        self.paths.screenshots_dir.clone()
     }
 
     pub(crate) fn settings_path(&self) -> PathBuf {
-        self.output_dir.join("settings.txt")
+        self.paths.settings_path.clone()
+    }
+
+    pub(crate) fn log_dir(&self) -> PathBuf {
+        self.paths.logs_dir.clone()
     }
 }
 
@@ -92,7 +88,7 @@ impl Default for RecorderConfig {
             post_roll_seconds: DEFAULT_POST_ROLL_SECONDS,
             segment_seconds: DEFAULT_SEGMENT_SECONDS,
             segment_buffer_seconds: DEFAULT_SEGMENT_BUFFER_SECONDS,
-            output_dir: default_output_dir(),
+            paths: AppPaths::installed_defaults(),
             audio: AudioConfig::default(),
         }
     }
@@ -163,7 +159,8 @@ pub(crate) fn parse_args() -> AppResult<AppConfig> {
             }
             "--output-dir" => {
                 let value = next_value(&args, &mut index, "--output-dir")?;
-                recorder.output_dir = absolute_path(PathBuf::from(value))?;
+                recorder.paths =
+                    AppPaths::from_output_dir(crate::paths::absolute_path(PathBuf::from(value))?);
             }
             "--no-system-audio" => {
                 recorder.audio.system_audio = false;
@@ -296,18 +293,6 @@ fn parse_u16(value: &str, flag: &str) -> AppResult<u16> {
     value
         .parse::<u16>()
         .map_err(|error| format!("{flag} must be a positive integer: {error}").into())
-}
-
-fn absolute_path(path: PathBuf) -> AppResult<PathBuf> {
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Ok(env::current_dir()?.join(path))
-    }
-}
-
-fn default_output_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 pub(crate) fn usage() -> &'static str {

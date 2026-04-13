@@ -2,14 +2,57 @@
 
 Windows Rust Record is a Windows replay recorder for saving recent gameplay or desktop highlights. It records the primary display into a rolling replay buffer, saves clips on demand from a global hotkey or tray menu, and can capture system audio plus an optional microphone.
 
-This project is still early, but it is usable from source with Cargo.
+This project is still early, but it can be packaged as a zip with the app and FFmpeg binaries included.
 
 ## Requirements
 
 - Windows
-- Rust and Cargo
-- FFmpeg and FFprobe available on `PATH`
 - A GPU/driver setup supported by FFmpeg `gfxcapture` and `h264_nvenc`, or the app will try the CPU readback fallback
+
+For packaged builds, FFmpeg is bundled in the zip. For source builds, either keep FFmpeg on `PATH` or place `ffmpeg.exe` and `ffprobe.exe` in `vendor\ffmpeg\bin`.
+
+## Download And Run
+
+1. Download `WindowsRustRecord-<version>-windows-x64.zip`.
+2. Extract the zip.
+3. Run `windows-rust-record-v2.exe`.
+
+The extracted folder should look like this:
+
+```text
+WindowsRustRecord-<version>-windows-x64\
+  windows-rust-record-v2.exe
+  README.md
+  ffmpeg\
+    bin\
+      ffmpeg.exe
+      ffprobe.exe
+```
+
+Windows may show SmartScreen the first time the app runs because the executable is not signed yet.
+
+## Build A Zip Release
+
+Install Rust and Cargo, then run:
+
+```powershell
+.\scripts\package-release.ps1 -FfmpegBinDir C:\path\to\ffmpeg\bin
+```
+
+If `ffmpeg.exe` and `ffprobe.exe` are already on `PATH`, this also works:
+
+```powershell
+.\scripts\package-release.ps1
+```
+
+The release folder and zip are written to `dist`:
+
+```text
+dist\WindowsRustRecord-0.1.0-windows-x64\
+dist\WindowsRustRecord-0.1.0-windows-x64.zip
+```
+
+Only redistribute FFmpeg builds whose license terms you understand and can comply with.
 
 Check FFmpeg from PowerShell:
 
@@ -55,7 +98,7 @@ The app will:
 - Start recording a rolling replay buffer.
 - Add a tray icon in the Windows notification area.
 - Register the default hotkey: `Ctrl+Alt+S`.
-- Save clips to `clips` under the project folder by default.
+- Save clips to `Videos\Windows Rust Record\clips` by default.
 
 If the tray icon is hidden, click the `^` overflow arrow near the Windows clock.
 
@@ -66,23 +109,23 @@ Right-click the tray icon to open the menu:
 - `Save replay`: save the recent replay buffer after the configured post-roll.
 - `Pause / resume`: stop or restart recording.
 - `Open clips folder`: open the clips directory in File Explorer.
-- `Open settings`: open `settings.txt` in Notepad.
+- `Open settings`: open `settings.toml` in Notepad.
 - `Reload settings`: reload the settings file and re-register the hotkey.
 - `Toggle start with Windows`: create or remove a Startup-folder launcher.
 - `Quit`: stop the recorder and exit.
 
 ## Hotkey And Settings
 
-The app creates a settings file at:
+The app creates a TOML settings file at:
 
 ```text
-settings.txt
+%APPDATA%\Windows Rust Record\settings.toml
 ```
 
-By default, this is under the project folder:
+Example:
 
 ```text
-C:\Users\samku\Coding\windows-rust-record-v2\settings.txt
+C:\Users\<you>\AppData\Roaming\Windows Rust Record\settings.toml
 ```
 
 Example settings:
@@ -108,14 +151,14 @@ Supported hotkey keys include single letters/numbers and function keys like `F1`
 
 ## Output Folders
 
-When no `--output-dir` is provided, output is written under the project folder:
+When no `--output-dir` is provided, user data is written to Windows profile folders:
 
 ```text
-clips
-replay-segments
-logs
-screenshots
-settings.txt
+%USERPROFILE%\Videos\Windows Rust Record\clips
+%USERPROFILE%\Videos\Windows Rust Record\screenshots
+%LOCALAPPDATA%\Windows Rust Record\replay-segments
+%LOCALAPPDATA%\Windows Rust Record\logs
+%APPDATA%\Windows Rust Record\settings.toml
 ```
 
 Clips are saved as MP4 files in `clips`.
@@ -182,9 +225,11 @@ cargo run -- --microphone --output-dir C:\Recordings\WindowsRustRecord
 
 ## Troubleshooting
 
-If the app says FFmpeg is missing, make sure `ffmpeg.exe` and `ffprobe.exe` are installed and available on `PATH`.
+If the packaged app says FFmpeg is missing, make sure the extracted app folder contains `ffmpeg\bin\ffmpeg.exe` and `ffmpeg\bin\ffprobe.exe`.
 
-If the global hotkey fails to register, another app may already be using it. Change `hotkey` in `settings.txt`, save the file, and choose `Reload settings` from the tray menu.
+If a source build says FFmpeg is missing, make sure `ffmpeg.exe` and `ffprobe.exe` are installed and available on `PATH`, or place them in `vendor\ffmpeg\bin`.
+
+If the global hotkey fails to register, another app may already be using it. Change `hotkey` in `settings.toml`, save the file, and choose `Reload settings` from the tray menu.
 
 If audio is missing, try running with only system audio first:
 
@@ -202,7 +247,7 @@ If the GPU capture backend fails at startup, the app logs the error and tries th
 
 ## Current Limitations
 
-- This is not packaged as an installer yet.
+- This is packaged as a zip, not a full installer.
 - Settings are edited through a text file, not a full settings window.
 - Device selection currently uses WASAPI device IDs rather than a friendly device picker.
-- The tray app still runs from a console while developing with Cargo.
+- The tray app still runs from a console while developing with Cargo. Release builds run as a Windows tray app without a console window.

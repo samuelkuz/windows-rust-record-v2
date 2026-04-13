@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod audio;
 mod capture;
@@ -6,6 +8,7 @@ mod diagnostics;
 mod display;
 mod ffmpeg;
 mod hotkey;
+mod paths;
 mod recorder;
 mod replay;
 mod screenshot;
@@ -47,8 +50,8 @@ fn main() -> AppResult<()> {
                 log_path = %log_path.display(),
                 seconds,
                 frame_rate = app_config.recorder.frame_rate,
-                output_dir = %app_config.recorder.output_dir.display(),
-                "starting record-test command"
+                clips_dir = %app_config.recorder.clip_dir().display(),
+                "starting record-test command"  
             );
             ffmpeg::ensure_available()?;
             run_record_test(&app_config.recorder, seconds)
@@ -60,7 +63,8 @@ fn main() -> AppResult<()> {
                 frame_rate = app_config.recorder.frame_rate,
                 replay_seconds = app_config.recorder.replay_seconds,
                 post_roll_seconds = app_config.recorder.post_roll_seconds,
-                output_dir = %app_config.recorder.output_dir.display(),
+                clips_dir = %app_config.recorder.clip_dir().display(),
+                replay_segments_dir = %app_config.recorder.segment_dir().display(),
                 "starting replay recorder command"
             );
             ffmpeg::ensure_available()?;
