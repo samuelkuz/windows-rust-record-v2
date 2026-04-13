@@ -1,32 +1,25 @@
-use std::mem::zeroed;
-
 use windows::Win32::{
     Foundation::{ERROR_HOTKEY_ALREADY_REGISTERED, GetLastError},
     UI::{
         Input::KeyboardAndMouse::{
-            HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey,
-            UnregisterHotKey, VK_S,
+            HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
+            RegisterHotKey, UnregisterHotKey,
         },
-        WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_HOTKEY},
+        WindowsAndMessaging::MSG,
     },
 };
 
 use crate::AppResult;
 
 const HOTKEY_ID: i32 = 1;
-const HOTKEY: Hotkey = Hotkey {
-    label: "Ctrl+Alt+S",
-    modifiers: HOT_KEY_MODIFIERS(MOD_CONTROL.0 | MOD_ALT.0 | MOD_NOREPEAT.0),
-    key: VK_S.0 as u32,
-};
 
 pub(crate) struct RegisteredHotkey {
     hotkey: Hotkey,
 }
 
 impl RegisteredHotkey {
-    pub(crate) fn label(&self) -> &'static str {
-        self.hotkey.label
+    pub(crate) fn label(&self) -> &str {
+        &self.hotkey.label
     }
 }
 
@@ -38,14 +31,14 @@ impl Drop for RegisteredHotkey {
     }
 }
 
-pub(crate) fn register() -> AppResult<RegisteredHotkey> {
-    if unsafe { RegisterHotKey(None, HOTKEY_ID, HOTKEY.modifiers, HOTKEY.key) }.is_ok() {
-        Ok(RegisteredHotkey { hotkey: HOTKEY })
+pub(crate) fn register(hotkey: Hotkey) -> AppResult<RegisteredHotkey> {
+    if unsafe { RegisterHotKey(None, HOTKEY_ID, hotkey.modifiers, hotkey.key) }.is_ok() {
+        Ok(RegisteredHotkey { hotkey })
     } else {
         let error = unsafe { GetLastError() };
         Err(format!(
             "Could not register {} as the replay hotkey: Windows error {} ({})",
-            HOTKEY.label,
+            hotkey.label,
             error.0,
             registration_error_message(error)
         )
@@ -53,18 +46,8 @@ pub(crate) fn register() -> AppResult<RegisteredHotkey> {
     }
 }
 
-pub(crate) fn run_message_loop(mut on_hotkey: impl FnMut()) {
-    let mut message = unsafe { zeroed::<MSG>() };
-    while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
-        if message.message == WM_HOTKEY && message.wParam.0 == HOTKEY_ID as usize {
-            on_hotkey();
-        } else {
-            unsafe {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-        }
-    }
+pub(crate) fn is_hotkey_message(message: &MSG) -> bool {
+    message.wParam.0 == HOTKEY_ID as usize
 }
 
 fn registration_error_message(error: windows::Win32::Foundation::WIN32_ERROR) -> &'static str {
@@ -76,9 +59,84 @@ fn registration_error_message(error: windows::Win32::Foundation::WIN32_ERROR) ->
     }
 }
 
-#[derive(Clone, Copy)]
-struct Hotkey {
-    label: &'static str,
+#[derive(Clone)]
+pub(crate) struct Hotkey {
+    label: String,
     modifiers: HOT_KEY_MODIFIERS,
     key: u32,
+}
+
+impl Hotkey {
+    pub(crate) fn parse(value: &str) -> AppResult<Self> {
+        let mut modifiers = MOD_NOREPEAT.0;
+        let mut key = None;
+        let mut labels = Vec::new();
+
+        for part in value.split('+') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => {
+                    modifiers |= MOD_CONTROL.0;
+                    labels.push("Ctrl".to_string());
+                }
+                "alt" => {
+                    modifiers |= MOD_ALT.0;
+                    labels.push("Alt".to_string());
+                }
+                "shift" => {
+                    modifiers |= MOD_SHIFT.0;
+                    labels.push("Shift".to_string());
+                }
+                "win" | "windows" | "super" => {
+                    modifiers |= MOD_WIN.0;
+                    labels.push("Win".to_string());
+                }
+                _ => {
+                    if key.is_some() {
+                        return Err(format!("Hotkey has more than one key: {value}").into());
+                    }
+                    let parsed_key = parse_key(part)?;
+                    key = Some(parsed_key);
+                    labels.push(part.to_ascii_uppercase());
+                }
+            }
+        }
+
+        let key = key.ok_or_else(|| format!("Hotkey must include a key: {value}"))?;
+        if modifiers == MOD_NOREPEAT.0 {
+            return Err(format!("Hotkey must include at least one modifier: {value}").into());
+        }
+
+        Ok(Self {
+            label: labels.join("+"),
+            modifiers: HOT_KEY_MODIFIERS(modifiers),
+            key,
+        })
+    }
+}
+
+fn parse_key(value: &str) -> AppResult<u32> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err("Hotkey key must not be empty".into());
+    };
+
+    if chars.next().is_none() && first.is_ascii_alphanumeric() {
+        return Ok(first.to_ascii_uppercase() as u32);
+    }
+
+    if let Some(number) = value
+        .strip_prefix('F')
+        .or_else(|| value.strip_prefix('f'))
+        .and_then(|number| number.parse::<u32>().ok())
+        && (1..=24).contains(&number)
+    {
+        return Ok(0x70 + number - 1);
+    }
+
+    Err(format!("Unsupported hotkey key: {value}").into())
 }

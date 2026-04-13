@@ -9,6 +9,8 @@ mod hotkey;
 mod recorder;
 mod replay;
 mod screenshot;
+mod settings;
+mod tray;
 
 use std::{sync::Arc, thread, time::Duration};
 
@@ -16,6 +18,8 @@ use app::ReplayApp;
 use capture::PrimaryDisplayCapture;
 use config::{AppCommand, AppConfig, RecorderConfig};
 use replay::ReplayBuffer;
+use settings::AppSettings;
+use tray::{TrayAction, TrayApp};
 
 pub(crate) type AppResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -79,9 +83,10 @@ fn run_record_test(config: &RecorderConfig, seconds: u64) -> AppResult<()> {
 }
 
 fn run_replay_recorder(app_config: AppConfig) -> AppResult<()> {
-    let registered_hotkey = hotkey::register()?;
     let recorder_config = app_config.recorder;
-    let app = ReplayApp::start(recorder_config.clone())?;
+    let mut settings = AppSettings::load_or_create(&recorder_config)?;
+    let mut registered_hotkey = Some(register_hotkey_from_settings(&settings)?);
+    let mut app = ReplayApp::start(recorder_config.clone())?;
     let snapshot = app.snapshot();
 
     println!("Replay recorder is running.");
@@ -92,23 +97,99 @@ fn run_replay_recorder(app_config: AppConfig) -> AppResult<()> {
     println!("Clips folder: {}", snapshot.clip_dir.display());
     println!(
         "Press {} to save the last {} seconds plus {} seconds after the hotkey.",
-        registered_hotkey.label(),
+        registered_hotkey
+            .as_ref()
+            .map(hotkey::RegisteredHotkey::label)
+            .unwrap_or("unregistered"),
         recorder_config.replay_seconds,
         recorder_config.post_roll_seconds
     );
     println!("Press Ctrl+C in this terminal to stop the app.");
+    println!("Settings file: {}", settings.path.display());
+    println!(
+        "A tray menu is also available with Save replay, Pause / resume, Open clips folder, Open settings, Reload settings, Toggle start with Windows, and Quit."
+    );
 
-    hotkey::run_message_loop(move || {
-        println!("Replay hotkey pressed; saving clip after post-roll...");
-        app.save_recent_clip_after_post_roll(|result| match result {
-            Ok(path) => {
-                println!("Saved replay clip: {}", path.display());
+    let tray = TrayApp::new()?;
+    tray.run_event_loop(move |action| match action {
+        TrayAction::SaveReplay => {
+            println!("Replay save requested; saving clip after post-roll...");
+            app.save_recent_clip_after_post_roll(|result| match result {
+                Ok(path) => {
+                    println!("Saved replay clip: {}", path.display());
+                }
+                Err(error) => {
+                    eprintln!("Failed to save replay clip: {error}");
+                }
+            });
+        }
+        TrayAction::OpenClipsFolder => {
+            if let Err(error) = app.open_clips_folder() {
+                eprintln!("Failed to open clips folder: {error}");
             }
-            Err(error) => {
-                eprintln!("Failed to save replay clip: {error}");
+        }
+        TrayAction::TogglePause => {
+            if let Err(error) = app.toggle_pause() {
+                eprintln!("Failed to toggle recording pause: {error}");
+            } else {
+                println!("Status: {}", app.snapshot().status.label());
             }
-        });
+        }
+        TrayAction::OpenSettings => {
+            if let Err(error) = settings.open_editor() {
+                eprintln!("Failed to open settings: {error}");
+            }
+        }
+        TrayAction::ReloadSettings => match AppSettings::load_or_create(&recorder_config) {
+            Ok(next_settings) => {
+                drop(registered_hotkey.take());
+                match register_hotkey_from_settings(&next_settings) {
+                    Ok(next_hotkey) => {
+                        println!("Reloaded settings. Hotkey: {}", next_hotkey.label());
+                        registered_hotkey = Some(next_hotkey);
+                        settings = next_settings;
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to reload hotkey from settings: {error}");
+                        match register_hotkey_from_settings(&settings) {
+                            Ok(previous_hotkey) => {
+                                eprintln!("Restored previous hotkey: {}", previous_hotkey.label());
+                                registered_hotkey = Some(previous_hotkey);
+                            }
+                            Err(previous_error) => {
+                                eprintln!("Could not restore previous hotkey: {previous_error}");
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => eprintln!("Failed to reload settings: {error}"),
+        },
+        TrayAction::ToggleStartup => {
+            let enabled = !settings.start_with_windows;
+            match settings.set_start_with_windows(enabled) {
+                Ok(()) => {
+                    println!(
+                        "Start with Windows: {}",
+                        if settings.start_with_windows {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    );
+                }
+                Err(error) => eprintln!("Failed to update startup setting: {error}"),
+            }
+        }
+        TrayAction::Quit => {
+            println!("Quit requested; stopping replay recorder.");
+        }
     });
 
     Ok(())
+}
+
+fn register_hotkey_from_settings(settings: &AppSettings) -> AppResult<hotkey::RegisteredHotkey> {
+    let hotkey = hotkey::Hotkey::parse(&settings.hotkey)?;
+    hotkey::register(hotkey)
 }

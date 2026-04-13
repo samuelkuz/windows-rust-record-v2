@@ -78,6 +78,10 @@ impl RecorderConfig {
     pub(crate) fn screenshot_dir(&self) -> PathBuf {
         self.output_dir.join("screenshots")
     }
+
+    pub(crate) fn settings_path(&self) -> PathBuf {
+        self.output_dir.join("settings.txt")
+    }
 }
 
 impl Default for RecorderConfig {

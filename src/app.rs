@@ -49,7 +49,6 @@ impl ReplayApp {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn pause(&mut self) {
         if self.recorder.take().is_some() {
             self.lock_state().status = AppStatus::Paused;
@@ -57,7 +56,6 @@ impl ReplayApp {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn resume(&mut self) -> AppResult<()> {
         if self.recorder.is_some() {
             return Ok(());
@@ -69,6 +67,15 @@ impl ReplayApp {
         self.lock_state().status = AppStatus::Recording;
         tracing::info!(backend = backend.label(), "recorder resumed");
         Ok(())
+    }
+
+    pub(crate) fn toggle_pause(&mut self) -> AppResult<()> {
+        if self.recorder.is_some() {
+            self.pause();
+            Ok(())
+        } else {
+            self.resume()
+        }
     }
 
     pub(crate) fn save_recent_clip_after_post_roll(
@@ -107,7 +114,6 @@ impl ReplayApp {
         });
     }
 
-    #[allow(dead_code)]
     pub(crate) fn open_clips_folder(&self) -> AppResult<()> {
         Command::new("explorer")
             .arg(self.config.clip_dir())
