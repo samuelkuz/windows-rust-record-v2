@@ -7,28 +7,28 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{AppResult, config::SEGMENT_SECONDS, ffmpeg};
+use crate::{AppResult, config::RecorderConfig, ffmpeg};
 
 const STABLE_COPY_ATTEMPTS: usize = 3;
 const STABLE_COPY_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 pub(crate) struct ReplayBuffer {
+    config: RecorderConfig,
     segment_dir: PathBuf,
     clip_dir: PathBuf,
 }
 
 impl ReplayBuffer {
-    pub(crate) fn new() -> AppResult<Self> {
-        let mut segment_dir = std::env::current_dir()?;
-        segment_dir.push("replay-segments");
+    pub(crate) fn new(config: RecorderConfig) -> AppResult<Self> {
+        let segment_dir = config.segment_dir();
         fs::create_dir_all(&segment_dir)?;
         clear_segment_dir(&segment_dir)?;
 
-        let mut clip_dir = std::env::current_dir()?;
-        clip_dir.push("clips");
+        let clip_dir = config.clip_dir();
         fs::create_dir_all(&clip_dir)?;
 
         Ok(Self {
+            config,
             segment_dir,
             clip_dir,
         })
@@ -41,24 +41,38 @@ impl ReplayBuffer {
     pub(crate) fn save_recent_clip(&self, seconds: u64) -> AppResult<PathBuf> {
         let segments = self.recent_segments(seconds)?;
         if segments.is_empty() {
+            tracing::warn!(seconds, "no replay segments are available yet");
             return Err("No replay segments are available yet".into());
         }
 
         let export_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let export_dir = self.clip_dir.join(format!("clip-work-{export_id}"));
         fs::create_dir_all(&export_dir)?;
+        tracing::info!(
+            seconds,
+            export_dir = %export_dir.display(),
+            segment_count = segments.len(),
+            "exporting recent replay clip"
+        );
 
         let copied_segments = copy_stable_segments(&segments, &export_dir)?;
         if copied_segments.is_empty() {
+            tracing::warn!("no replay segments could be copied for export");
             return Err("No replay segments could be copied for export".into());
         }
 
-        let concat_list = write_concat_list(&copied_segments, &export_dir)?;
+        let concat_list =
+            write_concat_list(&copied_segments, &export_dir, self.config.segment_seconds)?;
         let clip_path = self.clip_dir.join(format!("clip-{export_id}.mp4"));
         let temp_clip_path = self.clip_dir.join(format!("clip-{export_id}.tmp.mp4"));
         save_validated_clip(&concat_list, &temp_clip_path, &clip_path)?;
 
         if let Err(error) = fs::remove_dir_all(&export_dir) {
+            tracing::warn!(
+                path = %export_dir.display(),
+                error = %error,
+                "could not remove temporary replay export directory"
+            );
             eprintln!(
                 "Could not remove temporary replay export directory {}: {error}",
                 export_dir.display()
@@ -71,7 +85,7 @@ impl ReplayBuffer {
     fn recent_segments(&self, seconds: u64) -> AppResult<Vec<PathBuf>> {
         let now = SystemTime::now();
         let cutoff = now
-            .checked_sub(Duration::from_secs(seconds + SEGMENT_SECONDS))
+            .checked_sub(Duration::from_secs(seconds + self.config.segment_seconds))
             .ok_or("System clock underflow while selecting replay segments")?;
 
         let mut segments = fs::read_dir(&self.segment_dir)?
@@ -95,10 +109,17 @@ fn copy_stable_segments(segments: &[PathBuf], export_dir: &Path) -> AppResult<Ve
         let destination = export_dir.join(format!("segment-{index:03}.ts"));
         match copy_stable_segment(source, &destination) {
             Ok(()) => copied_segments.push(destination),
-            Err(error) => eprintln!(
-                "Skipping replay segment {} because it was not stable during export: {error}",
-                source.display()
-            ),
+            Err(error) => {
+                tracing::warn!(
+                    source = %source.display(),
+                    error = %error,
+                    "skipping replay segment because it was not stable during export"
+                );
+                eprintln!(
+                    "Skipping replay segment {} because it was not stable during export: {error}",
+                    source.display()
+                );
+            }
         }
     }
 
@@ -119,6 +140,11 @@ fn copy_stable_segment(source: &Path, destination: &Path) -> AppResult<()> {
         }
 
         if let Err(error) = fs::remove_file(destination) {
+            tracing::warn!(
+                path = %destination.display(),
+                error = %error,
+                "could not remove unstable copied segment"
+            );
             eprintln!(
                 "Could not remove unstable copied segment {}: {error}",
                 destination.display()
@@ -133,12 +159,16 @@ fn copy_stable_segment(source: &Path, destination: &Path) -> AppResult<()> {
     Err("segment changed while it was being copied".into())
 }
 
-fn write_concat_list(copied_segments: &[PathBuf], export_dir: &Path) -> AppResult<PathBuf> {
+fn write_concat_list(
+    copied_segments: &[PathBuf],
+    export_dir: &Path,
+    segment_seconds: u64,
+) -> AppResult<PathBuf> {
     let concat_list = export_dir.join("segments.txt");
     let mut concat_file = fs::File::create(&concat_list)?;
     for segment in copied_segments {
         writeln!(concat_file, "file '{}'", ffmpeg::concat_path(segment))?;
-        writeln!(concat_file, "duration {SEGMENT_SECONDS}.0")?;
+        writeln!(concat_file, "duration {segment_seconds}.0")?;
     }
     Ok(concat_list)
 }
@@ -154,6 +184,11 @@ fn save_validated_clip(
     {
         if let Err(remove_error) = fs::remove_file(temp_clip_path) {
             if remove_error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %temp_clip_path.display(),
+                    error = %remove_error,
+                    "could not remove failed temporary clip"
+                );
                 eprintln!(
                     "Could not remove failed temporary clip {}: {remove_error}",
                     temp_clip_path.display()

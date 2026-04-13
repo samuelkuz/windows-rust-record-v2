@@ -68,6 +68,7 @@ impl PreparedLoopbackAudio {
         thread::spawn(move || {
             if let Err(error) = run_loopback_capture(self.pipe_server, stop_requested) {
                 if !is_expected_pipe_close(error.as_ref()) {
+                    tracing::warn!(error = %error, "WASAPI loopback audio capture stopped");
                     eprintln!("WASAPI loopback audio capture stopped: {error}");
                 }
             }
@@ -101,6 +102,12 @@ fn run_loopback_capture(
     let mut pipe = pipe_server.connect()?;
     let _com = ComApartment::initialize()?;
     let capture = LoopbackCapture::open()?;
+    tracing::info!(
+        sample_rate = capture.spec.sample_rate,
+        channels = capture.spec.channels,
+        frame_bytes = capture.spec.frame_bytes,
+        "WASAPI loopback audio capture started"
+    );
     let _running = RunningAudioClient::start(&capture.audio_client)?;
     let mut timeline = AudioTimeline::new(capture.spec, capture.silence_fill_delay_frames);
 

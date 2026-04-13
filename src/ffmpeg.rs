@@ -4,10 +4,7 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use crate::{
-    AppResult,
-    config::{FRAME_RATE, SEGMENT_BUFFER_SECONDS, SEGMENT_SECONDS},
-};
+use crate::{AppResult, config::RecorderConfig};
 
 pub(crate) struct AudioInput {
     pub(crate) pipe_path: String,
@@ -82,15 +79,26 @@ pub(crate) fn write_png(path: &Path, width: i32, height: i32, pixels: &[u8]) -> 
 pub(crate) fn start_gpu_replay_encoder(
     primary_monitor_handle: u64,
     segment_path_pattern: PathBuf,
+    config: &RecorderConfig,
     audio_input: Option<AudioInput>,
 ) -> AppResult<Child> {
     if !supports_filter("gfxcapture") {
+        tracing::warn!("ffmpeg does not list the gfxcapture D3D11 capture source");
         return Err("ffmpeg does not list the gfxcapture D3D11 capture source".into());
     }
 
     if !supports_encoder("h264_nvenc") {
+        tracing::warn!("ffmpeg does not list h264_nvenc for D3D11 hardware-frame encoding");
         return Err("ffmpeg does not list h264_nvenc for D3D11 hardware-frame encoding".into());
     }
+
+    tracing::info!(
+        frame_rate = config.frame_rate,
+        primary_monitor_handle,
+        segment_path_pattern = %segment_path_pattern.display(),
+        audio = audio_input.is_some(),
+        "starting ffmpeg GPU replay encoder"
+    );
 
     let mut command = Command::new("ffmpeg");
     command.args([
@@ -100,19 +108,24 @@ pub(crate) fn start_gpu_replay_encoder(
         "-f",
         "lavfi",
         "-i",
-        &format!("gfxcapture=hmonitor={primary_monitor_handle}:max_framerate={FRAME_RATE}"),
+        &format!(
+            "gfxcapture=hmonitor={primary_monitor_handle}:max_framerate={}",
+            config.frame_rate
+        ),
     ]);
     apply_audio_input_options(&mut command, audio_input);
     apply_nvenc_options(&mut command);
-    apply_segment_options(&mut command, segment_path_pattern)
+    apply_segment_options(&mut command, segment_path_pattern, config)
 }
 
 pub(crate) fn start_cpu_replay_encoder(
     width: i32,
     height: i32,
     segment_path_pattern: PathBuf,
+    config: &RecorderConfig,
     audio_input: Option<AudioInput>,
 ) -> AppResult<Child> {
+    let has_audio = audio_input.is_some();
     let mut command = Command::new("ffmpeg");
     command.args([
         "-hide_banner",
@@ -125,16 +138,33 @@ pub(crate) fn start_cpu_replay_encoder(
         "-video_size",
         &format!("{width}x{height}"),
         "-framerate",
-        &FRAME_RATE.to_string(),
+        &config.frame_rate.to_string(),
         "-i",
         "pipe:0",
     ]);
     apply_audio_input_options(&mut command, audio_input);
 
     if supports_encoder("h264_nvenc") {
+        tracing::info!(
+            width,
+            height,
+            frame_rate = config.frame_rate,
+            segment_path_pattern = %segment_path_pattern.display(),
+            audio = has_audio,
+            "starting ffmpeg CPU replay encoder with NVENC"
+        );
         apply_nvenc_options(&mut command);
     } else {
+        tracing::warn!("ffmpeg does not list h264_nvenc; falling back to libx264");
         eprintln!("ffmpeg does not list h264_nvenc; falling back to libx264.");
+        tracing::info!(
+            width,
+            height,
+            frame_rate = config.frame_rate,
+            segment_path_pattern = %segment_path_pattern.display(),
+            audio = has_audio,
+            "starting ffmpeg CPU replay encoder with libx264"
+        );
         command.args([
             "-c:v",
             "libx264",
@@ -150,7 +180,7 @@ pub(crate) fn start_cpu_replay_encoder(
     }
 
     command.args(["-pix_fmt", "yuv420p"]);
-    apply_segment_options(&mut command, segment_path_pattern)
+    apply_segment_options(&mut command, segment_path_pattern, config)
 }
 
 fn apply_audio_input_options(command: &mut Command, audio_input: Option<AudioInput>) {
@@ -196,11 +226,18 @@ fn apply_nvenc_options(command: &mut Command) {
     ]);
 }
 
-fn apply_segment_options(command: &mut Command, segment_path_pattern: PathBuf) -> AppResult<Child> {
-    let gop_size = FRAME_RATE.to_string();
-    let segment_seconds = SEGMENT_SECONDS.to_string();
-    let segment_buffer_seconds = SEGMENT_BUFFER_SECONDS.to_string();
-    let force_key_frames = format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})");
+fn apply_segment_options(
+    command: &mut Command,
+    segment_path_pattern: PathBuf,
+    config: &RecorderConfig,
+) -> AppResult<Child> {
+    let gop_size = config.frame_rate.to_string();
+    let segment_seconds = config.segment_seconds.to_string();
+    let segment_wrap_count = config
+        .segment_buffer_seconds
+        .div_ceil(config.segment_seconds)
+        .to_string();
+    let force_key_frames = format!("expr:gte(t,n_forced*{})", config.segment_seconds);
 
     command
         .args([
@@ -217,7 +254,7 @@ fn apply_segment_options(command: &mut Command, segment_path_pattern: PathBuf) -
             "-segment_time",
             &segment_seconds,
             "-segment_wrap",
-            &segment_buffer_seconds,
+            &segment_wrap_count,
             "-reset_timestamps",
             "1",
             "-segment_format",

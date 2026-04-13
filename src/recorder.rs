@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    AppResult, audio, capture::PrimaryDisplayCapture, config::FRAME_RATE, display, ffmpeg,
+    AppResult, audio, capture::PrimaryDisplayCapture, config::RecorderConfig, display, ffmpeg,
     replay::ReplayBuffer,
 };
 
@@ -62,25 +62,36 @@ impl CaptureBackend {
     }
 }
 
-pub(crate) fn start(replay_buffer: Arc<ReplayBuffer>) -> AppResult<ReplayRecorder> {
-    match start_gpu_gfxcapture(replay_buffer.clone()) {
+pub(crate) fn start(
+    replay_buffer: Arc<ReplayBuffer>,
+    config: RecorderConfig,
+) -> AppResult<ReplayRecorder> {
+    match start_gpu_gfxcapture(replay_buffer.clone(), &config) {
         Ok(recorder) => Ok(recorder),
         Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not start GPU replay capture; falling back to CPU readback"
+            );
             eprintln!(
                 "Could not start GPU replay capture ({error}); falling back to CPU readback."
             );
-            start_cpu_readback(replay_buffer)
+            start_cpu_readback(replay_buffer, config)
         }
     }
 }
 
-fn start_gpu_gfxcapture(replay_buffer: Arc<ReplayBuffer>) -> AppResult<ReplayRecorder> {
+fn start_gpu_gfxcapture(
+    replay_buffer: Arc<ReplayBuffer>,
+    config: &RecorderConfig,
+) -> AppResult<ReplayRecorder> {
     let primary_monitor = display::primary_monitor_handle()?;
     let stop_requested = Arc::new(AtomicBool::new(false));
     let audio_input = prepare_audio_input();
     let mut gpu_encoder = ffmpeg::start_gpu_replay_encoder(
         primary_monitor.as_u64(),
         replay_buffer.segment_path_pattern(),
+        config,
         audio_input
             .as_ref()
             .map(audio::PreparedLoopbackAudio::ffmpeg_input),
@@ -90,6 +101,7 @@ fn start_gpu_gfxcapture(replay_buffer: Arc<ReplayBuffer>) -> AppResult<ReplayRec
 
     thread::sleep(Duration::from_millis(500));
     if let Some(status) = gpu_encoder.try_wait()? {
+        tracing::warn!(%status, "ffmpeg GPU capture exited during startup");
         return Err(
             format!("ffmpeg GPU capture exited during startup with status {status}").into(),
         );
@@ -104,7 +116,10 @@ fn start_gpu_gfxcapture(replay_buffer: Arc<ReplayBuffer>) -> AppResult<ReplayRec
     })
 }
 
-fn start_cpu_readback(replay_buffer: Arc<ReplayBuffer>) -> AppResult<ReplayRecorder> {
+fn start_cpu_readback(
+    replay_buffer: Arc<ReplayBuffer>,
+    config: RecorderConfig,
+) -> AppResult<ReplayRecorder> {
     let capturer = PrimaryDisplayCapture::new()?;
     let stop_requested = Arc::new(AtomicBool::new(false));
     let audio_input = prepare_audio_input();
@@ -115,6 +130,7 @@ fn start_cpu_readback(replay_buffer: Arc<ReplayBuffer>) -> AppResult<ReplayRecor
         capturer,
         replay_buffer,
         audio_ffmpeg_input,
+        config,
         Arc::clone(&stop_requested),
     )?;
     let audio_capture_thread =
@@ -133,12 +149,14 @@ fn start_cpu_readback_capture_thread(
     capturer: PrimaryDisplayCapture,
     replay_buffer: Arc<ReplayBuffer>,
     audio_input: Option<ffmpeg::AudioInput>,
+    config: RecorderConfig,
     stop_requested: Arc<AtomicBool>,
 ) -> AppResult<thread::JoinHandle<()>> {
     let mut encoder = ffmpeg::start_cpu_replay_encoder(
         capturer.width(),
         capturer.height(),
         replay_buffer.segment_path_pattern(),
+        &config,
         audio_input,
     )?;
     let mut encoder_stdin = encoder
@@ -147,7 +165,7 @@ fn start_cpu_readback_capture_thread(
         .ok_or("Could not open ffmpeg stdin for replay recording")?;
 
     Ok(thread::spawn(move || {
-        let frame_interval = Duration::from_millis(1_000 / FRAME_RATE as u64);
+        let frame_interval = Duration::from_secs_f64(1.0 / config.frame_rate as f64);
         let mut last_frame: Option<Vec<u8>> = None;
 
         while !stop_requested.load(Ordering::Relaxed) {
@@ -157,6 +175,7 @@ fn start_cpu_readback_capture_thread(
                     last_frame = Some(frame.pixels);
                     if let Some(frame_pixels) = &last_frame {
                         if let Err(error) = encoder_stdin.write_all(frame_pixels) {
+                            tracing::warn!(error = %error, "replay encoder stopped accepting frames");
                             eprintln!("Replay encoder stopped accepting frames: {error}");
                             break;
                         }
@@ -165,12 +184,17 @@ fn start_cpu_readback_capture_thread(
                 Err(error) => {
                     if let Some(frame_pixels) = &last_frame {
                         if let Err(write_error) = encoder_stdin.write_all(frame_pixels) {
+                            tracing::warn!(
+                                error = %write_error,
+                                "replay encoder stopped accepting repeated frames"
+                            );
                             eprintln!(
                                 "Replay encoder stopped accepting repeated frames: {write_error}"
                             );
                             break;
                         }
                     } else {
+                        tracing::warn!(error = %error, "could not capture initial replay frame");
                         eprintln!("Could not capture initial replay frame: {error}");
                     }
                 }
@@ -192,6 +216,10 @@ fn prepare_audio_input() -> Option<audio::PreparedLoopbackAudio> {
     match audio::prepare_loopback_audio() {
         Ok(audio_input) => Some(audio_input),
         Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "could not prepare WASAPI loopback audio; recording video only"
+            );
             eprintln!("Could not prepare WASAPI loopback audio; recording video only: {error}");
             None
         }

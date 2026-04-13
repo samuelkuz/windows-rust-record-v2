@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tracing = "0.1.44"
 windows = { version = "0.61.3", features = [
     "Win32_Storage_FileSystem",
     "Win32_Foundation",
