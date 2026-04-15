@@ -6,3 +6,5 @@
 /screenshots
 /settings.txt
 /settings.toml
+/.venv-openwakeword
+/test-audio

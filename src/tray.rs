@@ -1,6 +1,6 @@
 use std::{
     mem::zeroed,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender},
 };
 
 use tray_icon::{
@@ -19,18 +19,22 @@ use windows::Win32::{
 use crate::{AppResult, hotkey};
 
 const TRAY_EVENT_MESSAGE: u32 = WM_APP + 1;
+const EXTERNAL_ACTION_MESSAGE: u32 = WM_APP + 2;
 
 pub(crate) struct TrayApp {
     _tray_icon: TrayIcon,
     _menu: Menu,
     menu_ids: TrayMenuIds,
     menu_events: Receiver<MenuEvent>,
+    external_actions: Receiver<TrayAction>,
+    action_sender: TrayActionSender,
 }
 
 impl TrayApp {
     pub(crate) fn new() -> AppResult<Self> {
         let thread_id = unsafe { GetCurrentThreadId() };
         let (event_sender, menu_events) = mpsc::channel();
+        let (action_sender, external_actions) = mpsc::channel();
         MenuEvent::set_event_handler(Some(move |event| {
             let _ = event_sender.send(event);
             unsafe {
@@ -84,7 +88,16 @@ impl TrayApp {
             _menu: menu,
             menu_ids,
             menu_events,
+            external_actions,
+            action_sender: TrayActionSender {
+                sender: action_sender,
+                thread_id,
+            },
         })
+    }
+
+    pub(crate) fn action_sender(&self) -> TrayActionSender {
+        self.action_sender.clone()
     }
 
     pub(crate) fn run_event_loop(mut self, mut on_action: impl FnMut(TrayAction)) {
@@ -95,12 +108,18 @@ impl TrayApp {
                 continue;
             }
 
+            if message.message == EXTERNAL_ACTION_MESSAGE {
+                self.drain_external_actions(&mut on_action);
+                continue;
+            }
+
             unsafe {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
 
             self.drain_menu_events(&mut on_action);
+            self.drain_external_actions(&mut on_action);
         }
     }
 
@@ -118,6 +137,12 @@ impl TrayApp {
             }
         }
     }
+
+    fn drain_external_actions(&mut self, on_action: &mut impl FnMut(TrayAction)) {
+        while let Ok(action) = self.external_actions.try_recv() {
+            on_action(action);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +154,29 @@ pub(crate) enum TrayAction {
     ReloadSettings,
     ToggleStartup,
     Quit,
+}
+
+#[derive(Clone)]
+pub(crate) struct TrayActionSender {
+    sender: Sender<TrayAction>,
+    thread_id: u32,
+}
+
+impl TrayActionSender {
+    pub(crate) fn send(&self, action: TrayAction) -> AppResult<()> {
+        self.sender
+            .send(action)
+            .map_err(|error| format!("Could not queue tray action: {error}"))?;
+        unsafe {
+            PostThreadMessageW(
+                self.thread_id,
+                EXTERNAL_ACTION_MESSAGE,
+                WPARAM(0),
+                LPARAM(0),
+            )?;
+        }
+        Ok(())
+    }
 }
 
 struct TrayMenuIds {

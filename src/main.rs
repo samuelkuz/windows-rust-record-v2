@@ -14,6 +14,7 @@ mod replay;
 mod screenshot;
 mod settings;
 mod tray;
+mod voice_trigger;
 
 use std::{sync::Arc, thread, time::Duration};
 
@@ -92,6 +93,9 @@ fn run_replay_recorder(app_config: AppConfig) -> AppResult<()> {
     let mut registered_hotkey = Some(register_hotkey_from_settings(&settings)?);
     let mut app = ReplayApp::start(recorder_config.clone())?;
     let snapshot = app.snapshot();
+    let tray = TrayApp::new()?;
+    let _voice_trigger =
+        voice_trigger::start(&recorder_config.voice_trigger, tray.action_sender())?;
 
     println!("Replay recorder is running.");
     if let Some(backend) = app.backend() {
@@ -110,11 +114,16 @@ fn run_replay_recorder(app_config: AppConfig) -> AppResult<()> {
     );
     println!("Press Ctrl+C in this terminal to stop the app.");
     println!("Settings file: {}", settings.path.display());
+    if recorder_config.voice_trigger.enabled {
+        println!(
+            "Voice trigger: listening for clip that with model {}",
+            recorder_config.voice_trigger.model_path.display()
+        );
+    }
     println!(
         "A tray menu is also available with Save replay, Pause / resume, Open clips folder, Open settings, Reload settings, Toggle start with Windows, and Quit."
     );
 
-    let tray = TrayApp::new()?;
     tray.run_event_loop(move |action| match action {
         TrayAction::SaveReplay => {
             println!("Replay save requested; saving clip after post-roll...");

@@ -195,6 +195,13 @@ This records for 10 seconds and saves a replay clip.
 --audio-sample-rate <hz>     (default: 48000)
 --audio-channels <channels>  (default: 2)
 --audio-bitrate <bitrate>    (default: 160k)
+--voice-trigger
+--voice-trigger-python <path>
+--voice-trigger-script <path>
+--voice-trigger-model <path>
+--voice-trigger-threshold <0..1>
+--voice-trigger-cooldown-seconds <seconds>
+--voice-trigger-device <sounddevice-id-or-name>
 ```
 
 Examples:
@@ -216,6 +223,14 @@ Record microphone only:
 ```powershell
 cargo run -- --microphone --no-system-audio
 ```
+
+Enable the prototype openWakeWord voice trigger:
+
+```powershell
+cargo run -- --voice-trigger --voice-trigger-model .\models\wakeword\clip_that_v2.onnx
+```
+
+The voice trigger currently runs the Python openWakeWord monitor from `.venv-openwakeword` and saves a replay when it detects the wake phrase.
 
 Use a different output folder:
 

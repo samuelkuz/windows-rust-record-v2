@@ -1,0 +1,4 @@
+phrase = "clip that"
+trained_at = "2026-04-14"
+source = "openWakeWord Colab"
+threshold_tested = "0.65"

@@ -41,6 +41,7 @@ pub(crate) struct RecorderConfig {
     pub(crate) segment_buffer_seconds: u64,
     pub(crate) paths: AppPaths,
     pub(crate) audio: AudioConfig,
+    pub(crate) voice_trigger: VoiceTriggerConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +53,17 @@ pub(crate) struct AudioConfig {
     pub(crate) output_sample_rate: u32,
     pub(crate) output_channels: u16,
     pub(crate) bitrate: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VoiceTriggerConfig {
+    pub(crate) enabled: bool,
+    pub(crate) python_path: PathBuf,
+    pub(crate) script_path: PathBuf,
+    pub(crate) model_path: PathBuf,
+    pub(crate) threshold: f32,
+    pub(crate) cooldown_seconds: f32,
+    pub(crate) device: Option<String>,
 }
 
 impl RecorderConfig {
@@ -90,6 +102,7 @@ impl Default for RecorderConfig {
             segment_buffer_seconds: DEFAULT_SEGMENT_BUFFER_SECONDS,
             paths: AppPaths::installed_defaults(),
             audio: AudioConfig::default(),
+            voice_trigger: VoiceTriggerConfig::default(),
         }
     }
 }
@@ -104,6 +117,20 @@ impl Default for AudioConfig {
             output_sample_rate: DEFAULT_AUDIO_SAMPLE_RATE,
             output_channels: DEFAULT_AUDIO_CHANNELS,
             bitrate: "160k".to_string(),
+        }
+    }
+}
+
+impl Default for VoiceTriggerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            python_path: PathBuf::from(r".venv-openwakeword\Scripts\python.exe"),
+            script_path: PathBuf::from(r"scripts\monitor_openwakeword_mic.py"),
+            model_path: PathBuf::from(r"models\wakeword\clip_that_v2.onnx"),
+            threshold: 0.65,
+            cooldown_seconds: 3.0,
+            device: None,
         }
     }
 }
@@ -189,6 +216,34 @@ pub(crate) fn parse_args() -> AppResult<AppConfig> {
             "--audio-bitrate" => {
                 recorder.audio.bitrate = next_value(&args, &mut index, "--audio-bitrate")?;
             }
+            "--voice-trigger" => {
+                recorder.voice_trigger.enabled = true;
+                index += 1;
+            }
+            "--voice-trigger-python" => {
+                recorder.voice_trigger.python_path =
+                    PathBuf::from(next_value(&args, &mut index, "--voice-trigger-python")?);
+            }
+            "--voice-trigger-script" => {
+                recorder.voice_trigger.script_path =
+                    PathBuf::from(next_value(&args, &mut index, "--voice-trigger-script")?);
+            }
+            "--voice-trigger-model" => {
+                recorder.voice_trigger.model_path =
+                    PathBuf::from(next_value(&args, &mut index, "--voice-trigger-model")?);
+            }
+            "--voice-trigger-threshold" => {
+                recorder.voice_trigger.threshold =
+                    parse_next_f32(&args, &mut index, "--voice-trigger-threshold")?;
+            }
+            "--voice-trigger-cooldown-seconds" => {
+                recorder.voice_trigger.cooldown_seconds =
+                    parse_next_f32(&args, &mut index, "--voice-trigger-cooldown-seconds")?;
+            }
+            "--voice-trigger-device" => {
+                recorder.voice_trigger.device =
+                    Some(next_value(&args, &mut index, "--voice-trigger-device")?);
+            }
             unknown => return Err(format!("Unknown argument: {unknown}\n\n{}", usage()).into()),
         }
     }
@@ -249,6 +304,40 @@ fn validate_recorder_config(config: &RecorderConfig) -> AppResult<()> {
         return Err("--audio-bitrate must not be empty".into());
     }
 
+    if config.voice_trigger.enabled {
+        if !config.voice_trigger.python_path.exists() {
+            return Err(format!(
+                "--voice-trigger-python does not exist: {}",
+                config.voice_trigger.python_path.display()
+            )
+            .into());
+        }
+
+        if !config.voice_trigger.script_path.exists() {
+            return Err(format!(
+                "--voice-trigger-script does not exist: {}",
+                config.voice_trigger.script_path.display()
+            )
+            .into());
+        }
+
+        if !config.voice_trigger.model_path.exists() {
+            return Err(format!(
+                "--voice-trigger-model does not exist: {}",
+                config.voice_trigger.model_path.display()
+            )
+            .into());
+        }
+
+        if !(0.0..=1.0).contains(&config.voice_trigger.threshold) {
+            return Err("--voice-trigger-threshold must be between 0 and 1".into());
+        }
+
+        if config.voice_trigger.cooldown_seconds < 0.0 {
+            return Err("--voice-trigger-cooldown-seconds must not be negative".into());
+        }
+    }
+
     Ok(())
 }
 
@@ -265,6 +354,11 @@ fn parse_next_u64(args: &[String], index: &mut usize, flag: &str) -> AppResult<u
 fn parse_next_u16(args: &[String], index: &mut usize, flag: &str) -> AppResult<u16> {
     let value = next_value(args, index, flag)?;
     parse_u16(&value, flag)
+}
+
+fn parse_next_f32(args: &[String], index: &mut usize, flag: &str) -> AppResult<f32> {
+    let value = next_value(args, index, flag)?;
+    parse_f32(&value, flag)
 }
 
 fn next_value(args: &[String], index: &mut usize, flag: &str) -> AppResult<String> {
@@ -295,6 +389,12 @@ fn parse_u16(value: &str, flag: &str) -> AppResult<u16> {
         .map_err(|error| format!("{flag} must be a positive integer: {error}").into())
 }
 
+fn parse_f32(value: &str, flag: &str) -> AppResult<f32> {
+    value
+        .parse::<f32>()
+        .map_err(|error| format!("{flag} must be a number: {error}").into())
+}
+
 pub(crate) fn usage() -> &'static str {
     "Usage:
   windows-rust-record-v2 [options]
@@ -314,5 +414,12 @@ Options:
   --audio-input-device-id <wasapi-device-id>
   --audio-sample-rate <hz>     (default: 48000)
   --audio-channels <channels>  (default: 2)
-  --audio-bitrate <bitrate>    (default: 160k)"
+  --audio-bitrate <bitrate>    (default: 160k)
+  --voice-trigger
+  --voice-trigger-python <path>             (default: .venv-openwakeword\\Scripts\\python.exe)
+  --voice-trigger-script <path>             (default: scripts\\monitor_openwakeword_mic.py)
+  --voice-trigger-model <path>              (default: models\\wakeword\\clip_that_v2.onnx)
+  --voice-trigger-threshold <0..1>          (default: 0.65)
+  --voice-trigger-cooldown-seconds <secs>   (default: 3)
+  --voice-trigger-device <sounddevice-id-or-name>"
 }
